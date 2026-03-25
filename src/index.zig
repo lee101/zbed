@@ -424,9 +424,6 @@ fn walkDir(
 
         switch (entry.kind) {
             .directory => {
-                // Skip hidden directories
-                if (entry.name.len > 0 and entry.name[0] == '.') continue;
-
                 var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
                 defer subdir.close();
                 try walkDir(allocator, subdir, root, rel_path, ignore, model, index, progress_fn);
@@ -539,4 +536,46 @@ test "isTextFile" {
     try std.testing.expect(isTextFile("README"));
     try std.testing.expect(!isTextFile("image.png"));
     try std.testing.expect(!isTextFile("binary.exe"));
+}
+
+test "gitignore negation patterns" {
+    const allocator = std.testing.allocator;
+    var filter = IgnoreFilter.init(allocator);
+    defer filter.deinit();
+
+    // Ignore all .log files, but not important.log
+    const p1 = try allocator.dupe(u8, "*.log");
+    try filter.patterns.append(.{ .pattern = p1, .negation = false, .dir_only = false });
+    const p2 = try allocator.dupe(u8, "important.log");
+    try filter.patterns.append(.{ .pattern = p2, .negation = true, .dir_only = false });
+
+    try std.testing.expect(filter.shouldIgnore("debug.log"));
+    try std.testing.expect(!filter.shouldIgnore("important.log"));
+}
+
+test "gitignore .git vs .github" {
+    const allocator = std.testing.allocator;
+    var filter = IgnoreFilter.init(allocator);
+    defer filter.deinit();
+
+    // Same patterns as walkAndIndex adds
+    const p1 = try allocator.dupe(u8, ".git");
+    try filter.patterns.append(.{ .pattern = p1, .negation = false, .dir_only = true });
+    const p2 = try allocator.dupe(u8, ".zbed");
+    try filter.patterns.append(.{ .pattern = p2, .negation = false, .dir_only = true });
+
+    try std.testing.expect(filter.shouldIgnore(".git"));
+    try std.testing.expect(filter.shouldIgnore(".zbed"));
+    try std.testing.expect(!filter.shouldIgnore(".github"));
+    try std.testing.expect(!filter.shouldIgnore("src/main.zig"));
+}
+
+test "glob matching with wildcards" {
+    try std.testing.expect(matchSimpleGlob("*.txt", "foo.txt"));
+    try std.testing.expect(!matchSimpleGlob("*.txt", "foo.rs"));
+    try std.testing.expect(matchSimpleGlob("test_*", "test_foo"));
+    try std.testing.expect(!matchSimpleGlob("test_*", "foo_test"));
+    try std.testing.expect(matchSimpleGlob("*", "anything"));
+    try std.testing.expect(matchSimpleGlob("a?c", "abc"));
+    try std.testing.expect(!matchSimpleGlob("a?c", "abbc"));
 }

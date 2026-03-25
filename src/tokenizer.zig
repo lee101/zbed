@@ -252,6 +252,56 @@ test "basic tokenization without model" {
     try std.testing.expectEqual(@as(i16, 5), out[n - 1]); // [SEP]
 }
 
+test "tokenize empty and whitespace-only input" {
+    const allocator = std.testing.allocator;
+    var tok = Tokenizer.init(allocator);
+    defer tok.deinit();
+
+    const words_data = [_][]const u8{ "[CLS]", "[SEP]", "[UNK]" };
+    const ids_data = [_]i16{ 0, 1, 2 };
+    for (words_data, ids_data) |w, id| {
+        const owned = try allocator.dupe(u8, w);
+        try tok.owned_keys.append(owned);
+        try tok.vocab.put(owned, id);
+    }
+    tok.cls_id = 0;
+    tok.sep_id = 1;
+    tok.unk_id = 2;
+
+    // Empty input: should get [CLS] [SEP]
+    var out: [64]i16 = undefined;
+    const n1 = tok.tokenize("", &out);
+    try std.testing.expectEqual(@as(usize, 2), n1);
+    try std.testing.expectEqual(@as(i16, 0), out[0]); // [CLS]
+    try std.testing.expectEqual(@as(i16, 1), out[1]); // [SEP]
+
+    // Whitespace only
+    const n2 = tok.tokenize("   \t\n  ", &out);
+    try std.testing.expectEqual(@as(usize, 2), n2); // [CLS] [SEP]
+}
+
+test "tokenize with punctuation" {
+    const allocator = std.testing.allocator;
+    var tok = Tokenizer.init(allocator);
+    defer tok.deinit();
+    tok.add_special = false;
+
+    const words_data = [_][]const u8{ "hello", ".", "!" };
+    const ids_data = [_]i16{ 10, 11, 12 };
+    for (words_data, ids_data) |w, id| {
+        const owned = try allocator.dupe(u8, w);
+        try tok.owned_keys.append(owned);
+        try tok.vocab.put(owned, id);
+    }
+    tok.unk_id = -1;
+
+    var out: [64]i16 = undefined;
+    const n = tok.tokenize("hello!", &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(i16, 10), out[0]); // hello
+    try std.testing.expectEqual(@as(i16, 12), out[1]); // !
+}
+
 test "wordpiece subword splitting" {
     const allocator = std.testing.allocator;
     var tok = Tokenizer.init(allocator);

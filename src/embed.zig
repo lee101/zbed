@@ -209,23 +209,15 @@ pub const EmbedModel = struct {
             const scale = self.scales[tid];
             const row = self.weights[tid * dim .. (tid + 1) * dim];
 
-            // SIMD accumulation
+            // SIMD accumulation: i8 → i16 (widen) → f32 → scale+accumulate
             var j: usize = 0;
             while (j + SIMD_WIDTH <= out_dim) : (j += SIMD_WIDTH) {
                 const raw: VecI8 = row[j..][0..SIMD_WIDTH].*;
-                // Widen i8 → i16 → f32 and multiply by scale
-                const wide: VecI16 = @as(VecI16, raw);
-                const lo4: @Vector(4, i16) = @shuffle(i16, wide, undefined, [4]i32{ 0, 1, 2, 3 });
-                const hi4: @Vector(4, i16) = @shuffle(i16, wide, undefined, [4]i32{ 4, 5, 6, 7 });
-                const f_lo: @Vector(4, f32) = @floatFromInt(lo4);
-                const f_hi: @Vector(4, f32) = @floatFromInt(hi4);
-                const scale_vec4: @Vector(4, f32) = @splat(scale);
-
-                const cur_lo: @Vector(4, f32) = result[j..][0..4].*;
-                const cur_hi: @Vector(4, f32) = result[j + 4 ..][0..4].*;
-
-                result[j..][0..4].* = cur_lo + f_lo * scale_vec4;
-                (result[j + 4 ..])[0..4].* = cur_hi + f_hi * scale_vec4;
+                const wide: VecI16 = raw; // widening coercion i8 → i16
+                const floats: VecF32 = @floatFromInt(wide);
+                const scale_v: VecF32 = @splat(scale);
+                const cur: VecF32 = result[j..][0..SIMD_WIDTH].*;
+                result[j..][0..SIMD_WIDTH].* = cur + floats * scale_v;
             }
             // Scalar remainder
             while (j < out_dim) : (j += 1) {
@@ -324,4 +316,90 @@ test "embed tokens zero input" {
     try std.testing.expectEqual(@as(usize, 1), n2);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), result[0], 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), result[1], 0.01);
+}
+
+test "embed tokens SIMD path (dim=16)" {
+    const allocator = std.testing.allocator;
+    var model = EmbedModel.init(allocator);
+    defer model.deinit();
+
+    const dim = 16;
+    const vocab = 3;
+
+    model.weights = try allocator.alloc(i8, vocab * dim);
+    model.scales = try allocator.alloc(f32, vocab);
+    model.vocab_size = vocab;
+    model.embed_dim = dim;
+
+    // Token 0: all 10s, scale=0.1 → each element = 1.0
+    for (0..dim) |i| model.weights[0 * dim + i] = 10;
+    model.scales[0] = 0.1;
+
+    // Token 1: all 20s, scale=0.05 → each element = 1.0
+    for (0..dim) |i| model.weights[1 * dim + i] = 20;
+    model.scales[1] = 0.05;
+
+    // Token 2: values 1..16, scale=1.0
+    for (0..dim) |i| model.weights[2 * dim + i] = @intCast(i + 1);
+    model.scales[2] = 1.0;
+
+    // Single token: should get exact values via SIMD path
+    var result: [dim]f32 = undefined;
+    const tokens_single = [_]i16{2};
+    const n1 = model.embedTokens(&tokens_single, &result);
+    try std.testing.expectEqual(@as(usize, 1), n1);
+    for (0..dim) |i| {
+        try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(i + 1)), result[i], 0.001);
+    }
+
+    // Two tokens (0 and 1): both contribute 1.0 per element, mean = 1.0
+    const tokens_pair = [_]i16{ 0, 1 };
+    const n2 = model.embedTokens(&tokens_pair, &result);
+    try std.testing.expectEqual(@as(usize, 2), n2);
+    for (0..dim) |i| {
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), result[i], 0.001);
+    }
+
+    // Negative int8 values: Token 0 with negative weights
+    for (0..dim) |i| model.weights[0 * dim + i] = -50;
+    model.scales[0] = 0.02; // -50 * 0.02 = -1.0
+    const tokens_neg = [_]i16{0};
+    const n3 = model.embedTokens(&tokens_neg, &result);
+    try std.testing.expectEqual(@as(usize, 1), n3);
+    for (0..dim) |i| {
+        try std.testing.expectApproxEqAbs(@as(f32, -1.0), result[i], 0.001);
+    }
+}
+
+test "embed tokens mean pooling with three tokens" {
+    const allocator = std.testing.allocator;
+    var model = EmbedModel.init(allocator);
+    defer model.deinit();
+
+    const dim = 16;
+    const vocab = 3;
+
+    model.weights = try allocator.alloc(i8, vocab * dim);
+    model.scales = try allocator.alloc(f32, vocab);
+    model.vocab_size = vocab;
+    model.embed_dim = dim;
+
+    // Token 0: all 30s, scale=0.1 → 3.0
+    // Token 1: all 60s, scale=0.1 → 6.0
+    // Token 2: all 90s, scale=0.1 → 9.0
+    // Mean = (3 + 6 + 9) / 3 = 6.0
+    for (0..dim) |i| model.weights[0 * dim + i] = 30;
+    for (0..dim) |i| model.weights[1 * dim + i] = 60;
+    for (0..dim) |i| model.weights[2 * dim + i] = 90;
+    model.scales[0] = 0.1;
+    model.scales[1] = 0.1;
+    model.scales[2] = 0.1;
+
+    var result: [dim]f32 = undefined;
+    const tokens = [_]i16{ 0, 1, 2 };
+    const n = model.embedTokens(&tokens, &result);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    for (0..dim) |i| {
+        try std.testing.expectApproxEqAbs(@as(f32, 6.0), result[i], 0.001);
+    }
 }

@@ -266,3 +266,78 @@ test "flat index search" {
     try std.testing.expectEqual(@as(usize, 0), results[0].doc_idx); // best match
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), results[0].score, 0.001);
 }
+
+test "flat index search threshold filtering" {
+    const allocator = std.testing.allocator;
+    const dim = 8;
+    const n_docs = 4;
+
+    var idx = FlatIndex.init(allocator, dim);
+    defer idx.deinit();
+
+    const data = try allocator.alloc(f32, n_docs * dim);
+    @memset(data, 0);
+    data[0 * dim + 0] = 1.0; // doc 0: unit x
+    data[1 * dim + 1] = 1.0; // doc 1: unit y (orthogonal to query)
+    data[2 * dim + 0] = 1.0; // doc 2: diagonal xy
+    data[2 * dim + 1] = 1.0;
+    data[3 * dim + 0] = -1.0; // doc 3: opposite x
+
+    try idx.build(data, n_docs);
+
+    var query = [_]f32{0} ** dim;
+    query[0] = 1.0;
+
+    // High threshold: only exact and close matches
+    var results: [4]SearchResult = undefined;
+    const n = idx.search(&query, 4, 0.8, &results);
+    // Should only get doc 0 (score=1.0), not doc 1 (score=0), doc 2 (score~0.707), doc 3 (score=-1)
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(usize, 0), results[0].doc_idx);
+}
+
+test "flat index search top-k limiting" {
+    const allocator = std.testing.allocator;
+    const dim = 8;
+    const n_docs = 4;
+
+    var idx = FlatIndex.init(allocator, dim);
+    defer idx.deinit();
+
+    const data = try allocator.alloc(f32, n_docs * dim);
+    @memset(data, 0);
+    data[0 * dim + 0] = 1.0;
+    data[1 * dim + 0] = 0.9;
+    data[1 * dim + 1] = 0.1;
+    data[2 * dim + 0] = 0.8;
+    data[2 * dim + 1] = 0.2;
+    data[3 * dim + 0] = 0.7;
+    data[3 * dim + 1] = 0.3;
+
+    try idx.build(data, n_docs);
+
+    var query = [_]f32{0} ** dim;
+    query[0] = 1.0;
+
+    // Ask for top-2 only
+    var results: [2]SearchResult = undefined;
+    const n = idx.search(&query, 2, -1.0, &results);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    // Best two results, sorted descending
+    try std.testing.expect(results[0].score >= results[1].score);
+}
+
+test "cosine similarity with scalar remainder" {
+    // 11 elements: 8 SIMD + 3 scalar remainder
+    const a = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0 };
+    const b = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0 };
+    const sim = cosineSimilarity(&a, &b);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), sim, 0.001);
+}
+
+test "cosine similarity empty vectors" {
+    const a = [_]f32{};
+    const b = [_]f32{};
+    const sim = cosineSimilarity(&a, &b);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), sim, 0.001);
+}
