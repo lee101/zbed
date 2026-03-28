@@ -1,7 +1,8 @@
 const std = @import("std");
 const zbed = @import("zbed");
-
+const gpu = zbed.gpu;
 const EmbedModel = zbed.EmbedModel;
+const EmbedScratch = zbed.EmbedScratch;
 const Index = zbed.Index;
 const QuantizedEmbedding = zbed.QuantizedEmbedding;
 const SearchResult = zbed.SearchResult;
@@ -66,7 +67,7 @@ fn printUsage(program_name: []const u8) void {
         \\  {s} index [path]         Build a quantized search index
         \\  {s} status [path]        Show index statistics
         \\  {s} embed <text>         Run one real embedding inference
-        \\  {s} serve [--port N]      Start HTTP search server (default: 8080)
+        \\  {s} serve [--port N]      HTTP server with inotify live reindex
         \\  {s} bench                Run local embedding/search benchmarks
         \\  {s} help                 Show this help message
         \\
@@ -78,9 +79,12 @@ fn printUsage(program_name: []const u8) void {
         \\      --search-binaries    Index binary/media files by filename only
         \\      --gpu                Request GPU backend when available
         \\
-        \\Notes:
-        \\  Text files index both filename docs and content lines.
-        \\  Binary files index filename docs only when --search-binaries is enabled.
+        \\Server endpoints:
+        \\  POST /search             {{"query":"text","k":10}}
+        \\  POST /index              {{"documents":[{{"text":"...","id":1}}]}}
+        \\  POST /rebuild            Full reindex from filesystem
+        \\  POST /similarity         {{"text1":"a","text2":"b"}}
+        \\  GET  /status             Index stats + watch status
         \\
     , .{ program_name, program_name, program_name, program_name, program_name, program_name, program_name, program_name }) catch {};
 }
@@ -158,8 +162,28 @@ fn loadModel(allocator: std.mem.Allocator, opts: ParsedOptions) !EmbedModel {
 
 fn maybeReportGpuFallback(opts: ParsedOptions) !void {
     if (opts.use_gpu) {
-        try stderr().print("GPU backend requested; using CPU backend because no Zig CUDA bridge is linked in this build.\n", .{});
+        if (!gpu.cudaEnabled()) {
+            try stderr().print("GPU backend requested, but this build was compiled without CUDA support. Rebuild with -Dcuda=true.\n", .{});
+        } else if (!gpu.isAvailable()) {
+            try stderr().print("GPU backend requested, but no CUDA device/backend is currently available. Using CPU path.\n", .{});
+        }
     }
+}
+
+fn initGpuEmbedder(model: *const EmbedModel) ?gpu.GpuEmbedder {
+    if (!gpu.isAvailable() or model.embed_dim != 512) return null;
+    return gpu.GpuEmbedder.init(model) catch |err| {
+        stderr().print("GPU embedder init failed: {s} ({})\n", .{ gpu.lastErrorMessage(), err }) catch {};
+        return null;
+    };
+}
+
+fn initGpuSearchIndex(allocator: std.mem.Allocator, idx: *const Index) ?gpu.GpuSearchIndex {
+    if (!gpu.isAvailable() or idx.dim != 512) return null;
+    return gpu.GpuSearchIndex.init(allocator, idx) catch |err| {
+        stderr().print("GPU search init failed: {s} ({})\n", .{ gpu.lastErrorMessage(), err }) catch {};
+        return null;
+    };
 }
 
 fn cmdSearch(allocator: std.mem.Allocator, program_name: []const u8, args: []const []const u8) !void {
@@ -199,11 +223,16 @@ fn cmdSearch(allocator: std.mem.Allocator, program_name: []const u8, args: []con
 
     var idx = Index.init(allocator, model.embed_dim);
     defer idx.deinit();
+    var index_gpu_embedder = if (opts.use_gpu) initGpuEmbedder(&model) else null;
+    defer if (index_gpu_embedder) |*gpu_embedder| gpu_embedder.deinit();
 
     if (Index.exists(opts.target_path)) {
         try idx.load(opts.target_path);
     } else {
-        const walk_opts = WalkOptions{ .search_binaries = opts.search_binaries };
+        const walk_opts = WalkOptions{
+            .search_binaries = opts.search_binaries,
+            .gpu_embedder = if (index_gpu_embedder) |*gpu_embedder| gpu_embedder else null,
+        };
         try stderr().print("No index found. Building one for {s}...\n", .{opts.target_path});
         try zbed.index.walkAndIndex(allocator, opts.target_path, &model, &idx, walk_opts, null);
         try idx.save(opts.target_path);
@@ -215,20 +244,39 @@ fn cmdSearch(allocator: std.mem.Allocator, program_name: []const u8, args: []con
     }
 
     var query_embedding = QuantizedEmbedding{};
-    if (model.embedQuantized(query, &query_embedding) == 0) {
+    var maybe_gpu_embedder = if (opts.use_gpu) initGpuEmbedder(&model) else null;
+    defer if (maybe_gpu_embedder) |*gpu_embedder| gpu_embedder.deinit();
+    var query_scratch = EmbedScratch{};
+
+    const valid_tokens = if (maybe_gpu_embedder) |*gpu_embedder|
+        gpu_embedder.embedQuantized(&model, query, &query_scratch, &query_embedding) catch 0
+    else
+        model.embedQuantized(query, &query_embedding);
+    if (valid_tokens == 0) {
         try stdout().print("Query produced no valid tokens.\n", .{});
         return;
     }
 
     const search_index = idx.buildSearchIndex();
+    var maybe_gpu_search = if (opts.use_gpu) initGpuSearchIndex(allocator, &idx) else null;
+    defer if (maybe_gpu_search) |*gpu_search| gpu_search.deinit();
     var results: [MAX_RESULTS]SearchResult = undefined;
-    const n_results = search_index.search(
-        query_embedding.data[0..model.embed_dim],
-        query_embedding.norm,
-        @min(opts.limit, MAX_RESULTS),
-        opts.threshold,
-        &results,
-    );
+    const n_results = if (maybe_gpu_search) |*gpu_search|
+        gpu_search.search(&query_embedding, @min(opts.limit, MAX_RESULTS), opts.threshold, &results) catch search_index.search(
+            query_embedding.data[0..model.embed_dim],
+            query_embedding.norm,
+            @min(opts.limit, MAX_RESULTS),
+            opts.threshold,
+            &results,
+        )
+    else
+        search_index.search(
+            query_embedding.data[0..model.embed_dim],
+            query_embedding.norm,
+            @min(opts.limit, MAX_RESULTS),
+            opts.threshold,
+            &results,
+        );
 
     if (n_results == 0) {
         try stdout().print("No results found above threshold {d:.2}.\n", .{opts.threshold});
@@ -262,7 +310,13 @@ fn cmdIndex(allocator: std.mem.Allocator, program_name: []const u8, args: []cons
     var idx = Index.init(allocator, model.embed_dim);
     defer idx.deinit();
 
-    const walk_opts = WalkOptions{ .search_binaries = opts.search_binaries };
+    var maybe_gpu_embedder = if (opts.use_gpu) initGpuEmbedder(&model) else null;
+    defer if (maybe_gpu_embedder) |*gpu_embedder| gpu_embedder.deinit();
+
+    const walk_opts = WalkOptions{
+        .search_binaries = opts.search_binaries,
+        .gpu_embedder = if (maybe_gpu_embedder) |*gpu_embedder| gpu_embedder else null,
+    };
     const progress = struct {
         fn callback(count: usize) void {
             if (count > 0 and count % 1000 == 0) {
@@ -323,7 +377,14 @@ fn cmdEmbed(allocator: std.mem.Allocator, program_name: []const u8, args: []cons
     defer model.deinit();
 
     var quantized = QuantizedEmbedding{};
-    const valid = model.embedQuantized(text, &quantized);
+    var maybe_gpu_embedder = if (opts.use_gpu) initGpuEmbedder(&model) else null;
+    defer if (maybe_gpu_embedder) |*gpu_embedder| gpu_embedder.deinit();
+
+    var scratch = EmbedScratch{};
+    const valid = if (maybe_gpu_embedder) |*gpu_embedder|
+        gpu_embedder.embedQuantized(&model, text, &scratch, &quantized) catch model.embedQuantized(text, &quantized)
+    else
+        model.embedQuantized(text, &quantized);
     try stdout().print("tokens={d} dim={d} scale={d:.6} norm={d:.3}\n", .{ valid, model.embed_dim, quantized.scale, quantized.norm });
     try stdout().print("first16=", .{});
     const show = @min(model.embed_dim, 16);
@@ -355,16 +416,44 @@ fn cmdBench(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var timer = try std.time.Timer.start();
     var quantized = QuantizedEmbedding{};
     const iters: usize = 200;
+    var cpu_embed_checksum: i64 = 0;
     for (0..iters) |_| {
         for (texts) |text| {
-            _ = model.embedQuantized(text, &quantized);
+            const valid = model.embedQuantized(text, &quantized);
+            cpu_embed_checksum += @intCast(valid);
+            cpu_embed_checksum += quantized.data[0];
+            cpu_embed_checksum += quantized.data[1];
         }
     }
 
     const elapsed_ns = timer.read();
     const total = iters * texts.len;
     const us_per = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(total)) / 1000.0;
-    try stdout().print("Embedding benchmark: {d} runs, {d:.1} us/embed\n", .{ total, us_per });
+    try stdout().print("CPU embedding benchmark: {d} runs, {d:.1} us/embed (checksum={d})\n", .{ total, us_per, cpu_embed_checksum });
+
+    if (opts.use_gpu and gpu.isAvailable() and model.embed_dim == 512) {
+        if (gpu.deviceName(allocator, 0) catch null) |name| {
+            defer allocator.free(name);
+            try stdout().print("CUDA device: {s}\n", .{name});
+        }
+
+        var gpu_embedder = initGpuEmbedder(&model) orelse return;
+        defer gpu_embedder.deinit();
+        var scratch = EmbedScratch{};
+        var gpu_embed_checksum: i64 = 0;
+
+        timer.reset();
+        for (0..iters) |_| {
+            for (texts) |text| {
+                const valid = gpu_embedder.embedQuantized(&model, text, &scratch, &quantized) catch 0;
+                gpu_embed_checksum += @intCast(valid);
+                gpu_embed_checksum += quantized.data[0];
+                gpu_embed_checksum += quantized.data[1];
+            }
+        }
+        const gpu_embed_us = @as(f64, @floatFromInt(timer.read())) / @as(f64, @floatFromInt(total)) / 1000.0;
+        try stdout().print("GPU embedding benchmark: {d} runs, {d:.1} us/embed (checksum={d})\n", .{ total, gpu_embed_us, gpu_embed_checksum });
+    }
 
     var idx = Index.init(allocator, model.embed_dim);
     defer idx.deinit();
@@ -375,13 +464,35 @@ fn cmdBench(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     const search_index = idx.buildSearchIndex();
     var results: [8]SearchResult = undefined;
+    var cpu_search_checksum: f64 = 0;
     timer.reset();
     for (0..1000) |_| {
         _ = model.embedQuantized("binary filename audio search", &quantized);
-        _ = search_index.search(quantized.data[0..model.embed_dim], quantized.norm, 3, 0.0, &results);
+        const found = search_index.search(quantized.data[0..model.embed_dim], quantized.norm, 3, 0.0, &results);
+        cpu_search_checksum += @floatFromInt(found);
+        if (found > 0) cpu_search_checksum += results[0].score;
     }
     const search_us = @as(f64, @floatFromInt(timer.read())) / 1000.0 / 1000.0;
-    try stdout().print("Search benchmark: 1000 runs, {d:.1} us/search\n", .{search_us});
+    try stdout().print("CPU search benchmark: 1000 runs, {d:.1} us/search (checksum={d:.3})\n", .{ search_us, cpu_search_checksum });
+
+    if (opts.use_gpu and gpu.isAvailable() and idx.dim == 512) {
+        var gpu_search = initGpuSearchIndex(allocator, &idx) orelse return;
+        defer gpu_search.deinit();
+        var gpu_embedder = initGpuEmbedder(&model) orelse return;
+        defer gpu_embedder.deinit();
+        var scratch = EmbedScratch{};
+        var gpu_search_checksum: f64 = 0;
+
+        timer.reset();
+        for (0..1000) |_| {
+            _ = gpu_embedder.embedQuantized(&model, "binary filename audio search", &scratch, &quantized) catch 0;
+            const found = gpu_search.search(&quantized, 3, 0.0, &results) catch 0;
+            gpu_search_checksum += @floatFromInt(found);
+            if (found > 0) gpu_search_checksum += results[0].score;
+        }
+        const gpu_search_us = @as(f64, @floatFromInt(timer.read())) / 1000.0 / 1000.0;
+        try stdout().print("GPU search benchmark: 1000 runs, {d:.1} us/search (checksum={d:.3})\n", .{ gpu_search_us, gpu_search_checksum });
+    }
 }
 
 fn cmdServe(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -389,14 +500,11 @@ fn cmdServe(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try maybeReportGpuFallback(opts);
 
     var port: u16 = 8080;
-    var index_path: ?[]const u8 = null;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         if ((std.mem.eql(u8, args[i], "--port") or std.mem.eql(u8, args[i], "-P")) and i + 1 < args.len) {
             port = std.fmt.parseInt(u16, args[i + 1], 10) catch 8080;
             i += 1;
-        } else if (args[i].len > 0 and args[i][0] != '-') {
-            index_path = args[i];
         }
     }
 
@@ -406,14 +514,21 @@ fn cmdServe(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var idx = Index.init(allocator, model.embed_dim);
     defer idx.deinit();
 
-    if (index_path) |path| {
-        if (Index.exists(path)) {
-            try stderr().print("Loading index from {s}/.zbed/index.bin...\n", .{path});
-            try idx.load(path);
-            try stderr().print("Loaded {d} documents.\n", .{idx.count()});
-        }
+    if (Index.exists(opts.target_path)) {
+        try stderr().print("Loading index from {s}/.zbed/index.bin\n", .{opts.target_path});
+        try idx.load(opts.target_path);
+        try stderr().print("{d} docs loaded\n", .{idx.count()});
+    } else {
+        try stderr().print("Building index for {s}...\n", .{opts.target_path});
+        const walk_opts = WalkOptions{ .search_binaries = opts.search_binaries };
+        try zbed.index.walkAndIndex(allocator, opts.target_path, &model, &idx, walk_opts, null);
+        try idx.save(opts.target_path);
+        try stderr().print("{d} docs indexed\n", .{idx.count()});
     }
 
-    var state = zbed.ServerState.init(allocator, &model, &idx);
+    const walk_opts = WalkOptions{ .search_binaries = opts.search_binaries };
+    var state = zbed.ServerState.init(allocator, &model, &idx, opts.target_path, walk_opts);
+    defer state.deinit();
+
     try zbed.server.run(allocator, &state, port);
 }

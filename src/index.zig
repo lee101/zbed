@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const embed_mod = @import("embed.zig");
+const gpu_mod = @import("gpu.zig");
 const search_mod = @import("search.zig");
 
 const INDEX_MAGIC: u32 = 0x5A424544;
@@ -25,6 +26,7 @@ pub const WalkOptions = struct {
     min_line_length: usize = 3,
     max_line_length: usize = 1200,
     include_path_documents: bool = true,
+    gpu_embedder: ?*gpu_mod.GpuEmbedder = null,
 };
 
 pub const CountSummary = struct {
@@ -94,6 +96,65 @@ pub const Index = struct {
 
     pub fn count(self: *const Index) usize {
         return self.documents.items.len;
+    }
+
+    /// Remove all documents with the given file_path. Returns number removed.
+    pub fn removeByPath(self: *Index, path: []const u8) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.documents.items.len) {
+            if (std.mem.eql(u8, self.documents.items[i].file_path, path)) {
+                _ = self.documents.orderedRemove(i);
+                _ = self.scales.orderedRemove(i);
+                _ = self.norms.orderedRemove(i);
+                // Remove dim-sized embedding slice
+                const start = i * self.dim;
+                const end = start + self.dim;
+                if (end <= self.embeddings.items.len) {
+                    std.mem.copyForwards(i8, self.embeddings.items[start..], self.embeddings.items[end..]);
+                    self.embeddings.items.len -= self.dim;
+                }
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        return removed;
+    }
+
+    /// Reindex a single file: remove old docs then re-embed.
+    pub fn reindexFile(
+        self: *Index,
+        allocator: Allocator,
+        root: []const u8,
+        rel_path: []const u8,
+        model: *const embed_mod.EmbedModel,
+        options: WalkOptions,
+    ) !usize {
+        _ = self.removeByPath(rel_path);
+
+        var full_buf: [4096]u8 = undefined;
+        const full_path = try std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ root, rel_path });
+
+        std.fs.cwd().access(full_path, .{}) catch return 0; // file deleted
+
+        const file_type = detectFileType(full_path, rel_path, options);
+        var scratch = embed_mod.EmbedScratch{};
+        var quantized = embed_mod.QuantizedEmbedding{};
+
+        const before = self.count();
+        switch (file_type) {
+            .ignored, .too_large => {},
+            .binary => {
+                if (options.search_binaries) {
+                    try indexBinaryFile(allocator, rel_path, model, self, options, &scratch, &quantized);
+                }
+            },
+            .text => {
+                try indexTextFile(allocator, full_path, rel_path, model, self, options, &scratch, &quantized);
+            },
+        }
+        return self.count() - before;
     }
 
     pub fn buildSearchIndex(self: *const Index) search_mod.QuantizedFlatIndex {
@@ -329,7 +390,7 @@ fn walkDir(
                     .ignored, .too_large => continue,
                     .binary => {
                         if (!options.search_binaries) continue;
-                        try indexBinaryFile(allocator, rel_path, model, index, scratch, quantized);
+                        try indexBinaryFile(allocator, rel_path, model, index, options, scratch, quantized);
                     },
                     .text => {
                         try indexTextFile(allocator, full_path, rel_path, model, index, options, scratch, quantized);
@@ -343,12 +404,15 @@ fn walkDir(
     }
 }
 
-fn indexBinaryFile(allocator: Allocator, rel_path: []const u8, model: *const embed_mod.EmbedModel, index: *Index, scratch: *embed_mod.EmbedScratch, quantized: *embed_mod.QuantizedEmbedding) !void {
+fn indexBinaryFile(allocator: Allocator, rel_path: []const u8, model: *const embed_mod.EmbedModel, index: *Index, options: WalkOptions, scratch: *embed_mod.EmbedScratch, quantized: *embed_mod.QuantizedEmbedding) !void {
     const display_name = std.fs.path.basename(rel_path);
     const search_text = try normalizePathForSearch(allocator, rel_path);
     defer allocator.free(search_text);
 
-    const valid = model.embedQuantizedWithScratch(search_text, scratch, quantized);
+    const valid = if (options.gpu_embedder) |gpu_embedder|
+        try gpu_embedder.embedQuantized(model, search_text, scratch, quantized)
+    else
+        model.embedQuantizedWithScratch(search_text, scratch, quantized);
     if (valid == 0) return;
 
     try index.addDocumentQuantized(rel_path, 0, display_name, .binary, quantized.data[0..model.embed_dim], quantized.scale, quantized.norm);
@@ -360,7 +424,11 @@ fn indexTextFile(allocator: Allocator, full_path: []const u8, rel_path: []const 
         const search_text = try normalizePathForSearch(allocator, rel_path);
         defer allocator.free(search_text);
 
-        if (model.embedQuantizedWithScratch(search_text, scratch, quantized) > 0) {
+        const valid = if (options.gpu_embedder) |gpu_embedder|
+            try gpu_embedder.embedQuantized(model, search_text, scratch, quantized)
+        else
+            model.embedQuantizedWithScratch(search_text, scratch, quantized);
+        if (valid > 0) {
             try index.addDocumentQuantized(rel_path, 0, display_name, .path, quantized.data[0..model.embed_dim], quantized.scale, quantized.norm);
         }
     }
@@ -378,7 +446,11 @@ fn indexTextFile(allocator: Allocator, full_path: []const u8, rel_path: []const 
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len < options.min_line_length) continue;
         if (trimmed.len > options.max_line_length) continue;
-        if (model.embedQuantizedWithScratch(trimmed, scratch, quantized) == 0) continue;
+        const valid = if (options.gpu_embedder) |gpu_embedder|
+            try gpu_embedder.embedQuantized(model, trimmed, scratch, quantized)
+        else
+            model.embedQuantizedWithScratch(trimmed, scratch, quantized);
+        if (valid == 0) continue;
 
         try index.addDocumentQuantized(rel_path, line_num, trimmed, .text, quantized.data[0..model.embed_dim], quantized.scale, quantized.norm);
     }
