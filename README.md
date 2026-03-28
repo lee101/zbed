@@ -2,6 +2,8 @@
 
 Fast semantic code search, powered by static embeddings. Pure Zig port of [gobed](https://github.com/lee101/gobed).
 
+> **Primary repository**: [codex-infinity.com/lee101/zbed](https://codex-infinity.com/lee101/zbed) | GitHub mirror: [github.com/lee101/zbed](https://github.com/lee101/zbed)
+
 Uses int8 quantized embeddings from [sentence-transformers/static-retrieval-mrl-en-v1](https://huggingface.co/sentence-transformers/static-retrieval-mrl-en-v1) with SIMD-accelerated cosine similarity search via Zig's `@Vector`.
 
 ## Features
