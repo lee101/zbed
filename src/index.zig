@@ -3,244 +3,473 @@ const Allocator = std.mem.Allocator;
 const embed_mod = @import("embed.zig");
 const search_mod = @import("search.zig");
 
-/// Magic number for .zbed index files.
-const INDEX_MAGIC: u32 = 0x5A424544; // "ZBED"
-/// Current index format version.
-const INDEX_VERSION: u8 = 1;
+const INDEX_MAGIC: u32 = 0x5A424544;
+const INDEX_VERSION: u8 = 2;
 
-/// A single indexed line (document).
-pub const Document = struct {
-    /// File path (relative to indexed root)
-    file_path: []const u8,
-    /// 1-based line number
-    line_num: u32,
-    /// Line content
-    content: []const u8,
+pub const DocumentKind = enum(u8) {
+    path = 0,
+    text = 1,
+    binary = 2,
 };
 
-/// Persistent semantic search index.
-pub const Index = struct {
-    /// All indexed documents.
-    documents: std.ArrayList(Document),
-    /// Flat f32 embeddings [n_docs * dim].
-    embeddings: std.ArrayList(f32),
-    /// Embedding dimension.
-    dim: usize,
-    /// Root path that was indexed.
-    root_path: []const u8,
-    /// Owned strings for documents.
-    string_arena: std.heap.ArenaAllocator,
+pub const Document = struct {
+    file_path: []const u8,
+    line_num: u32,
+    content: []const u8,
+    kind: DocumentKind,
+};
 
+pub const WalkOptions = struct {
+    search_binaries: bool = false,
+    max_file_size: u64 = 10 * 1024 * 1024,
+    min_line_length: usize = 3,
+    max_line_length: usize = 1200,
+    include_path_documents: bool = true,
+};
+
+pub const CountSummary = struct {
+    files: usize = 0,
+    path_docs: usize = 0,
+    text_docs: usize = 0,
+    binary_docs: usize = 0,
+};
+
+pub const Index = struct {
+    documents: std.ArrayListUnmanaged(Document),
+    embeddings: std.ArrayListUnmanaged(i8),
+    scales: std.ArrayListUnmanaged(f32),
+    norms: std.ArrayListUnmanaged(f32),
+    dim: usize,
+    string_arena: std.heap.ArenaAllocator,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, dim: usize) Index {
         return .{
-            .documents = std.ArrayList(Document).init(allocator),
-            .embeddings = std.ArrayList(f32).init(allocator),
+            .documents = .{},
+            .embeddings = .{},
+            .scales = .{},
+            .norms = .{},
             .dim = dim,
-            .root_path = "",
             .string_arena = std.heap.ArenaAllocator.init(allocator),
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Index) void {
-        self.documents.deinit();
-        self.embeddings.deinit();
+        self.documents.deinit(self.allocator);
+        self.embeddings.deinit(self.allocator);
+        self.scales.deinit(self.allocator);
+        self.norms.deinit(self.allocator);
         self.string_arena.deinit();
     }
 
-    /// Add a document with its embedding to the index.
-    pub fn addDocument(self: *Index, file_path: []const u8, line_num: u32, content: []const u8, embedding: []const f32) !void {
+    pub fn reset(self: *Index) void {
+        self.documents.deinit(self.allocator);
+        self.embeddings.deinit(self.allocator);
+        self.scales.deinit(self.allocator);
+        self.norms.deinit(self.allocator);
+        self.documents = .{};
+        self.embeddings = .{};
+        self.scales = .{};
+        self.norms = .{};
+        self.string_arena.deinit();
+        self.string_arena = std.heap.ArenaAllocator.init(self.allocator);
+    }
+
+    pub fn addDocumentQuantized(self: *Index, file_path: []const u8, line_num: u32, content: []const u8, kind: DocumentKind, embedding: []const i8, scale: f32, norm: f32) !void {
         const arena = self.string_arena.allocator();
         const owned_path = try arena.dupe(u8, file_path);
         const owned_content = try arena.dupe(u8, content);
 
-        try self.documents.append(.{
+        try self.documents.append(self.allocator, .{
             .file_path = owned_path,
             .line_num = line_num,
             .content = owned_content,
+            .kind = kind,
         });
-        try self.embeddings.appendSlice(embedding[0..self.dim]);
+        try self.embeddings.appendSlice(self.allocator, embedding[0..self.dim]);
+        try self.scales.append(self.allocator, scale);
+        try self.norms.append(self.allocator, norm);
     }
 
-    /// Number of indexed documents.
     pub fn count(self: *const Index) usize {
         return self.documents.items.len;
     }
 
-    /// Build a FlatIndex for searching.
-    pub fn buildSearchIndex(self: *const Index, allocator: Allocator) !search_mod.FlatIndex {
-        var flat = search_mod.FlatIndex.init(allocator, self.dim);
-        if (self.count() == 0) return flat;
-
-        const data = try allocator.alloc(f32, self.embeddings.items.len);
-        @memcpy(data, self.embeddings.items);
-        try flat.build(data, self.count());
-        return flat;
+    pub fn buildSearchIndex(self: *const Index) search_mod.QuantizedFlatIndex {
+        return search_mod.QuantizedFlatIndex.init(self.embeddings.items, self.norms.items, self.dim);
     }
 
-    // ── Persistence ─────────────────────────────────────────────────
-
-    /// Save index to .zbed/index.bin under the given directory.
     pub fn save(self: *const Index, dir_path: []const u8) !void {
-        // Ensure .zbed directory exists
         var zbed_buf: [4096]u8 = undefined;
         const zbed_path = try std.fmt.bufPrint(&zbed_buf, "{s}/.zbed", .{dir_path});
-
         std.fs.cwd().makeDir(zbed_path) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
 
         var path_buf: [4096]u8 = undefined;
         const full_path = try std.fmt.bufPrint(&path_buf, "{s}/.zbed/index.bin", .{dir_path});
-
         const file = try std.fs.cwd().createFile(full_path, .{});
         defer file.close();
-        const writer = file.writer();
 
-        // Header
-        try writer.writeInt(u32, INDEX_MAGIC, .little);
-        try writer.writeInt(u8, INDEX_VERSION, .little);
-        try writer.writeInt(u32, @intCast(self.dim), .little);
-        try writer.writeInt(u32, @intCast(self.count()), .little);
+        try writeU32(file, INDEX_MAGIC);
+        try file.writeAll(&[_]u8{INDEX_VERSION});
+        try writeU32(file, @intCast(self.dim));
+        try writeU32(file, @intCast(self.count()));
 
-        // Documents
-        for (self.documents.items) |doc| {
-            try writeString(writer, doc.file_path);
-            try writer.writeInt(u32, doc.line_num, .little);
-            try writeString(writer, doc.content);
+        for (self.documents.items, 0..) |doc, idx| {
+            try file.writeAll(&[_]u8{@intFromEnum(doc.kind)});
+            try writeU32(file, doc.line_num);
+            try writeString(file, doc.file_path);
+            try writeString(file, doc.content);
+            try writeF32(file, self.scales.items[idx]);
+            try writeF32(file, self.norms.items[idx]);
         }
 
-        // Embeddings (raw f32 bytes)
-        const emb_bytes = std.mem.sliceAsBytes(self.embeddings.items);
-        try writer.writeAll(emb_bytes);
+        try file.writeAll(std.mem.sliceAsBytes(self.embeddings.items));
     }
 
-    /// Load index from .zbed/index.bin under the given directory.
     pub fn load(self: *Index, dir_path: []const u8) !void {
+        self.reset();
+
         var path_buf: [4096]u8 = undefined;
         const full_path = try std.fmt.bufPrint(&path_buf, "{s}/.zbed/index.bin", .{dir_path});
-
         const file = try std.fs.cwd().openFile(full_path, .{});
         defer file.close();
-        const reader = file.reader();
 
-        // Header
-        const magic = try reader.readInt(u32, .little);
+        const magic = try readU32(file);
         if (magic != INDEX_MAGIC) return error.InvalidMagic;
 
-        const version = try reader.readInt(u8, .little);
-        if (version != INDEX_VERSION) return error.UnsupportedVersion;
+        var version_buf: [1]u8 = undefined;
+        const version_read = try file.readAll(&version_buf);
+        if (version_read != 1) return error.UnexpectedEof;
+        if (version_buf[0] != INDEX_VERSION) return error.UnsupportedVersion;
 
-        const dim = try reader.readInt(u32, .little);
-        const n_docs = try reader.readInt(u32, .little);
-
-        self.dim = @intCast(dim);
-
-        // Clear existing data
-        self.documents.clearRetainingCapacity();
-        self.embeddings.clearRetainingCapacity();
-
+        self.dim = try readU32(file);
+        const n_docs = try readU32(file);
         const arena = self.string_arena.allocator();
 
-        // Read documents
-        for (0..n_docs) |_| {
-            const file_path = try readString(reader, arena);
-            const line_num = try reader.readInt(u32, .little);
-            const content = try readString(reader, arena);
+        try self.documents.ensureTotalCapacity(self.allocator, n_docs);
+        try self.scales.ensureTotalCapacity(self.allocator, n_docs);
+        try self.norms.ensureTotalCapacity(self.allocator, n_docs);
 
-            try self.documents.append(.{
+        for (0..n_docs) |_| {
+            var kind_buf: [1]u8 = undefined;
+            const kind_read = try file.readAll(&kind_buf);
+            if (kind_read != 1) return error.UnexpectedEof;
+            const line_num = try readU32(file);
+            const file_path = try readString(file, arena);
+            const content = try readString(file, arena);
+            const scale = try readF32(file);
+            const norm = try readF32(file);
+
+            const kind = std.meta.intToEnum(DocumentKind, kind_buf[0]) catch return error.InvalidDocumentKind;
+            try self.documents.append(self.allocator, .{
                 .file_path = file_path,
                 .line_num = line_num,
                 .content = content,
+                .kind = kind,
             });
+            try self.scales.append(self.allocator, scale);
+            try self.norms.append(self.allocator, norm);
         }
 
-        // Read embeddings
-        const emb_count = n_docs * self.dim;
-        try self.embeddings.resize(emb_count);
+        const emb_count = @as(usize, n_docs) * self.dim;
+        try self.embeddings.resize(self.allocator, emb_count);
         const emb_bytes = std.mem.sliceAsBytes(self.embeddings.items);
-        const bytes_read = try reader.readAll(emb_bytes);
-        if (bytes_read != emb_bytes.len) return error.UnexpectedEof;
+        const emb_read = try file.readAll(emb_bytes);
+        if (emb_read != emb_bytes.len) return error.UnexpectedEof;
     }
 
-    /// Check if a cached index exists for the given directory.
     pub fn exists(dir_path: []const u8) bool {
         var path_buf: [4096]u8 = undefined;
         const full_path = std.fmt.bufPrint(&path_buf, "{s}/.zbed/index.bin", .{dir_path}) catch return false;
         std.fs.cwd().access(full_path, .{}) catch return false;
         return true;
     }
+
+    pub fn summarize(self: *const Index, allocator: Allocator) !CountSummary {
+        var files = std.StringHashMap(void).init(allocator);
+        defer files.deinit();
+
+        var summary = CountSummary{};
+        for (self.documents.items) |doc| {
+            try files.put(doc.file_path, {});
+            switch (doc.kind) {
+                .path => summary.path_docs += 1,
+                .text => summary.text_docs += 1,
+                .binary => summary.binary_docs += 1,
+            }
+        }
+        summary.files = files.count();
+        return summary;
+    }
 };
 
-// ── Wire helpers ─────────────────────────────────────────────────────
-
-fn writeString(writer: anytype, s: []const u8) !void {
-    try writer.writeInt(u32, @intCast(s.len), .little);
-    try writer.writeAll(s);
+fn writeU32(file: std.fs.File, val: u32) !void {
+    const bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, val));
+    try file.writeAll(&bytes);
 }
 
-fn readString(reader: anytype, allocator: Allocator) ![]const u8 {
-    const len = try reader.readInt(u32, .little);
+fn readU32(file: std.fs.File) !u32 {
+    var buf: [4]u8 = undefined;
+    const n = try file.readAll(&buf);
+    if (n != 4) return error.UnexpectedEof;
+    return std.mem.littleToNative(u32, std.mem.bytesToValue(u32, &buf));
+}
+
+fn writeF32(file: std.fs.File, val: f32) !void {
+    try writeU32(file, @bitCast(val));
+}
+
+fn readF32(file: std.fs.File) !f32 {
+    const bits = try readU32(file);
+    return @bitCast(bits);
+}
+
+fn writeString(file: std.fs.File, s: []const u8) !void {
+    try writeU32(file, @intCast(s.len));
+    try file.writeAll(s);
+}
+
+fn readString(file: std.fs.File, allocator: Allocator) ![]const u8 {
+    const len = try readU32(file);
     if (len > 10 * 1024 * 1024) return error.StringTooLong;
     const buf = try allocator.alloc(u8, len);
-    const n = try reader.readAll(buf);
+    const n = try file.readAll(buf);
     if (n != len) return error.UnexpectedEof;
     return buf;
 }
 
-// ── .gitignore-aware directory walking ──────────────────────────────
-
-/// Known text file extensions for indexing.
 const TEXT_EXTENSIONS = [_][]const u8{
-    ".txt", ".md",  ".rst", ".tex",  ".go",   ".py",   ".js",   ".ts",
-    ".jsx", ".tsx", ".c",   ".cpp",  ".h",    ".hpp",  ".rs",   ".rb",
-    ".php", ".java",".cs",  ".swift",".kt",   ".scala",".zig",  ".nim",
-    ".lua", ".r",   ".m",   ".hs",   ".ml",   ".elm",  ".clj",  ".ex",
-    ".erl", ".fs",  ".vb",  ".dart", ".html", ".css",  ".scss", ".sass",
-    ".less",".vue", ".xml", ".json", ".yaml", ".yml",  ".toml", ".ini",
-    ".conf",".cfg", ".sh",  ".bash", ".zsh",  ".fish", ".ps1",  ".bat",
-    ".cmd", ".sql", ".graphql",".proto",".cmake",".makefile",
+    ".txt", ".md", ".rst", ".tex", ".go", ".py", ".js", ".ts", ".jsx", ".tsx",
+    ".c", ".cpp", ".h", ".hpp", ".rs", ".rb", ".php", ".java", ".cs", ".swift",
+    ".kt", ".scala", ".zig", ".lua", ".json", ".yaml", ".yml", ".toml", ".ini",
+    ".conf", ".cfg", ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd",
+    ".sql", ".graphql", ".proto", ".html", ".css", ".scss", ".sass", ".less",
+    ".xml", ".dockerfile", ".gitignore",
 };
 
-/// Check if a file extension suggests a text file.
+const BINARY_EXTENSIONS = [_][]const u8{
+    ".exe", ".dll", ".so", ".dylib", ".o", ".a", ".zip", ".tar", ".gz", ".7z",
+    ".rar", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico", ".pdf",
+    ".mp3", ".opus", ".flac", ".wav", ".m4a", ".aac", ".mp4", ".m4v", ".avi",
+    ".mov", ".mkv", ".webm", ".ttf", ".woff", ".woff2", ".db", ".sqlite",
+};
+
+const DEFAULT_IGNORES = [_][]const u8{
+    ".git", ".zbed", ".bed", "node_modules", "vendor", "dist", "build", "target",
+    ".cache", "__pycache__", ".venv", "model",
+};
+
+const FileType = enum {
+    text,
+    binary,
+    ignored,
+    too_large,
+};
+
+pub fn walkAndIndex(allocator: Allocator, root: []const u8, model: *const embed_mod.EmbedModel, index: *Index, options: WalkOptions, progress_fn: ?*const fn (usize) void) !void {
+    var ignore = IgnoreFilter.init(allocator);
+    defer ignore.deinit();
+
+    for (DEFAULT_IGNORES) |pattern| {
+        try ignore.add(pattern, false, true);
+    }
+
+    var gi_buf: [4096]u8 = undefined;
+    const gi_path = std.fmt.bufPrint(&gi_buf, "{s}/.gitignore", .{root}) catch null;
+    if (gi_path) |path| {
+        ignore.loadFile(path) catch {};
+    }
+
+    var dir = try std.fs.cwd().openDir(root, .{ .iterate = true });
+    defer dir.close();
+
+    var scratch = embed_mod.EmbedScratch{};
+    var quantized = embed_mod.QuantizedEmbedding{};
+    try walkDir(allocator, dir, root, "", &ignore, model, index, options, &scratch, &quantized, progress_fn);
+}
+
+fn walkDir(
+    allocator: Allocator,
+    dir: std.fs.Dir,
+    root: []const u8,
+    rel_prefix: []const u8,
+    ignore: *const IgnoreFilter,
+    model: *const embed_mod.EmbedModel,
+    index: *Index,
+    options: WalkOptions,
+    scratch: *embed_mod.EmbedScratch,
+    quantized: *embed_mod.QuantizedEmbedding,
+    progress_fn: ?*const fn (usize) void,
+) !void {
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        var rel_buf: [4096]u8 = undefined;
+        const rel_path = if (rel_prefix.len > 0)
+            try std.fmt.bufPrint(&rel_buf, "{s}/{s}", .{ rel_prefix, entry.name })
+        else
+            try std.fmt.bufPrint(&rel_buf, "{s}", .{entry.name});
+
+        switch (entry.kind) {
+            .directory => {
+                if (ignore.shouldIgnore(rel_path, true)) continue;
+                var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
+                defer subdir.close();
+                try walkDir(allocator, subdir, root, rel_path, ignore, model, index, options, scratch, quantized, progress_fn);
+            },
+            .file => {
+                if (ignore.shouldIgnore(rel_path, false)) continue;
+
+                var full_buf: [4096]u8 = undefined;
+                const full_path = try std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ root, rel_path });
+                const file_type = detectFileType(full_path, rel_path, options);
+                switch (file_type) {
+                    .ignored, .too_large => continue,
+                    .binary => {
+                        if (!options.search_binaries) continue;
+                        try indexBinaryFile(allocator, rel_path, model, index, scratch, quantized);
+                    },
+                    .text => {
+                        try indexTextFile(allocator, full_path, rel_path, model, index, options, scratch, quantized);
+                    },
+                }
+
+                if (progress_fn) |callback| callback(index.count());
+            },
+            else => {},
+        }
+    }
+}
+
+fn indexBinaryFile(allocator: Allocator, rel_path: []const u8, model: *const embed_mod.EmbedModel, index: *Index, scratch: *embed_mod.EmbedScratch, quantized: *embed_mod.QuantizedEmbedding) !void {
+    const display_name = std.fs.path.basename(rel_path);
+    const search_text = try normalizePathForSearch(allocator, rel_path);
+    defer allocator.free(search_text);
+
+    const valid = model.embedQuantizedWithScratch(search_text, scratch, quantized);
+    if (valid == 0) return;
+
+    try index.addDocumentQuantized(rel_path, 0, display_name, .binary, quantized.data[0..model.embed_dim], quantized.scale, quantized.norm);
+}
+
+fn indexTextFile(allocator: Allocator, full_path: []const u8, rel_path: []const u8, model: *const embed_mod.EmbedModel, index: *Index, options: WalkOptions, scratch: *embed_mod.EmbedScratch, quantized: *embed_mod.QuantizedEmbedding) !void {
+    if (options.include_path_documents) {
+        const display_name = std.fs.path.basename(rel_path);
+        const search_text = try normalizePathForSearch(allocator, rel_path);
+        defer allocator.free(search_text);
+
+        if (model.embedQuantizedWithScratch(search_text, scratch, quantized) > 0) {
+            try index.addDocumentQuantized(rel_path, 0, display_name, .path, quantized.data[0..model.embed_dim], quantized.scale, quantized.norm);
+        }
+    }
+
+    const file = try std.fs.cwd().openFile(full_path, .{});
+    defer file.close();
+
+    const data = file.readToEndAlloc(allocator, options.max_file_size) catch return;
+    defer allocator.free(data);
+
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    var line_num: u32 = 0;
+    while (lines.next()) |line| {
+        line_num += 1;
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len < options.min_line_length) continue;
+        if (trimmed.len > options.max_line_length) continue;
+        if (model.embedQuantizedWithScratch(trimmed, scratch, quantized) == 0) continue;
+
+        try index.addDocumentQuantized(rel_path, line_num, trimmed, .text, quantized.data[0..model.embed_dim], quantized.scale, quantized.norm);
+    }
+}
+
+fn detectFileType(full_path: []const u8, rel_path: []const u8, options: WalkOptions) FileType {
+    const stat = std.fs.cwd().statFile(full_path) catch return .ignored;
+    if (@as(u64, @intCast(stat.size)) > options.max_file_size) return .too_large;
+
+    if (isTextFile(rel_path)) return .text;
+    if (isBinaryExtension(rel_path)) return .binary;
+    return if (isLikelyBinary(full_path)) .binary else .text;
+}
+
 pub fn isTextFile(path: []const u8) bool {
-    // Check known names without extension
     const basename = std.fs.path.basename(path);
     const known_names = [_][]const u8{
-        "Makefile",  "Dockerfile", "Vagrantfile", "Rakefile", "Gemfile",
-        "README",    "LICENSE",    "CHANGELOG",   "CONTRIBUTING",
-        "Justfile",  "Taskfile",   "Procfile",    ".gitignore",
-        ".gitattributes", ".editorconfig", ".eslintrc", ".prettierrc",
-        "build.zig", "build.zig.zon",
+        "Makefile", "Dockerfile", "README", "LICENSE", "build.zig", "build.zig.zon",
     };
     for (known_names) |name| {
         if (std.mem.eql(u8, basename, name)) return true;
     }
 
-    // Check extension
     const ext = std.fs.path.extension(path);
     if (ext.len == 0) return false;
+    return matchExtension(ext, &TEXT_EXTENSIONS);
+}
 
-    const ext_lower_buf = blk: {
-        var buf: [32]u8 = undefined;
-        const len = @min(ext.len, buf.len);
-        for (0..len) |i| {
-            buf[i] = std.ascii.toLower(ext[i]);
-        }
-        break :blk buf[0..len];
-    };
+fn isBinaryExtension(path: []const u8) bool {
+    const ext = std.fs.path.extension(path);
+    if (ext.len == 0) return false;
+    return matchExtension(ext, &BINARY_EXTENSIONS);
+}
 
-    for (TEXT_EXTENSIONS) |te| {
-        if (std.mem.eql(u8, ext_lower_buf, te)) return true;
+fn matchExtension(ext: []const u8, extensions: []const []const u8) bool {
+    var lower_buf: [32]u8 = undefined;
+    const len = @min(ext.len, lower_buf.len);
+    for (0..len) |i| lower_buf[i] = std.ascii.toLower(ext[i]);
+    const lower = lower_buf[0..len];
+
+    for (extensions) |candidate| {
+        if (std.mem.eql(u8, lower, candidate)) return true;
     }
     return false;
 }
 
-/// Load .gitignore patterns from a file (simple glob matching).
-pub const IgnoreFilter = struct {
-    patterns: std.ArrayList(IgnorePattern),
+fn isLikelyBinary(full_path: []const u8) bool {
+    const file = std.fs.cwd().openFile(full_path, .{}) catch return true;
+    defer file.close();
+
+    var buf: [8192]u8 = undefined;
+    const n = file.readAll(&buf) catch return true;
+    if (n == 0) return false;
+
+    if (std.mem.indexOfScalar(u8, buf[0..n], 0) != null) return true;
+
+    var non_printable: usize = 0;
+    for (buf[0..n]) |byte| {
+        if ((byte < 32 and byte != '\n' and byte != '\r' and byte != '\t') or (byte > 126 and byte < 128)) {
+            non_printable += 1;
+        }
+    }
+    return @as(f32, @floatFromInt(non_printable)) / @as(f32, @floatFromInt(n)) > 0.3;
+}
+
+fn normalizePathForSearch(allocator: Allocator, rel_path: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    errdefer out.deinit(allocator);
+
+    var last_space = false;
+    for (rel_path) |byte| {
+        const lowered = std.ascii.toLower(byte);
+        const mapped = switch (lowered) {
+            '/', '\\', '.', '-', '_' => ' ',
+            else => lowered,
+        };
+
+        if (mapped == ' ') {
+            if (last_space) continue;
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+        try out.append(allocator, mapped);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+const IgnoreFilter = struct {
+    patterns: std.ArrayListUnmanaged(IgnorePattern),
     allocator: Allocator,
 
     const IgnorePattern = struct {
@@ -249,22 +478,28 @@ pub const IgnoreFilter = struct {
         dir_only: bool,
     };
 
-    pub fn init(allocator: Allocator) IgnoreFilter {
+    fn init(allocator: Allocator) IgnoreFilter {
         return .{
-            .patterns = std.ArrayList(IgnorePattern).init(allocator),
+            .patterns = .{},
             .allocator = allocator,
         };
     }
 
-    pub fn deinit(self: *IgnoreFilter) void {
-        for (self.patterns.items) |p| {
-            self.allocator.free(p.pattern);
-        }
-        self.patterns.deinit();
+    fn deinit(self: *IgnoreFilter) void {
+        for (self.patterns.items) |pattern| self.allocator.free(pattern.pattern);
+        self.patterns.deinit(self.allocator);
     }
 
-    /// Load patterns from a .gitignore file.
-    pub fn loadFile(self: *IgnoreFilter, path: []const u8) !void {
+    fn add(self: *IgnoreFilter, pattern: []const u8, negation: bool, dir_only: bool) !void {
+        const owned = try self.allocator.dupe(u8, pattern);
+        try self.patterns.append(self.allocator, .{
+            .pattern = owned,
+            .negation = negation,
+            .dir_only = dir_only,
+        });
+    }
+
+    fn loadFile(self: *IgnoreFilter, path: []const u8) !void {
         const file = std.fs.cwd().openFile(path, .{}) catch return;
         defer file.close();
 
@@ -288,54 +523,41 @@ pub const IgnoreFilter = struct {
                 line = line[0 .. line.len - 1];
             }
 
-            // Strip leading slash (anchored pattern, treated same for simplicity)
-            if (line.len > 0 and line[0] == '/') {
-                line = line[1..];
-            }
-
+            if (line.len > 0 and line[0] == '/') line = line[1..];
             if (line.len == 0) continue;
-            const owned = try self.allocator.dupe(u8, line);
-            try self.patterns.append(.{
-                .pattern = owned,
-                .negation = negation,
-                .dir_only = dir_only,
-            });
+            try self.add(line, negation, dir_only);
         }
     }
 
-    /// Check if a relative path should be ignored.
-    pub fn shouldIgnore(self: *const IgnoreFilter, rel_path: []const u8) bool {
+    fn shouldIgnore(self: *const IgnoreFilter, rel_path: []const u8, is_dir: bool) bool {
         var ignored = false;
-        for (self.patterns.items) |pat| {
-            if (matchGlob(pat.pattern, rel_path) or matchBasename(pat.pattern, rel_path)) {
-                ignored = !pat.negation;
+        for (self.patterns.items) |pattern| {
+            if (pattern.dir_only and !is_dir) {
+                if (!matchesDirectoryPattern(pattern.pattern, rel_path)) continue;
+            } else if (!(matchGlob(pattern.pattern, rel_path) or matchBasename(pattern.pattern, rel_path))) {
+                continue;
             }
+            ignored = !pattern.negation;
         }
         return ignored;
     }
 };
 
-/// Simple glob matching supporting * and **.
+fn matchesDirectoryPattern(pattern: []const u8, path: []const u8) bool {
+    if (matchBasename(pattern, path)) return true;
+    return std.mem.startsWith(u8, path, pattern) or std.mem.indexOf(u8, path, pattern) != null;
+}
+
 fn matchGlob(pattern: []const u8, path: []const u8) bool {
-    // Simple cases
     if (std.mem.eql(u8, pattern, path)) return true;
-
-    // Check if pattern matches the path basename
-    if (std.mem.indexOf(u8, pattern, "/") == null) {
-        // No slash in pattern - match against any path component
-        return matchSimpleGlob(pattern, std.fs.path.basename(path));
-    }
-
-    // Pattern has slash - match against full relative path
+    if (std.mem.indexOfScalar(u8, pattern, '/') == null) return matchSimpleGlob(pattern, std.fs.path.basename(path));
     return matchSimpleGlob(pattern, path);
 }
 
 fn matchBasename(pattern: []const u8, path: []const u8) bool {
-    const basename = std.fs.path.basename(path);
-    return matchSimpleGlob(pattern, basename);
+    return matchSimpleGlob(pattern, std.fs.path.basename(path));
 }
 
-/// Match a simple glob pattern (with * wildcards) against a string.
 fn matchSimpleGlob(pattern: []const u8, str: []const u8) bool {
     var pi: usize = 0;
     var si: usize = 0;
@@ -347,21 +569,11 @@ fn matchSimpleGlob(pattern: []const u8, str: []const u8) bool {
             pi += 1;
             si += 1;
         } else if (pi < pattern.len and pattern[pi] == '*') {
-            // Handle ** (match path separators too)
-            if (pi + 1 < pattern.len and pattern[pi + 1] == '*') {
-                pi += 2;
-                // Skip optional / after **
-                if (pi < pattern.len and pattern[pi] == '/') pi += 1;
-                // ** matches everything including /
-                star_p = pi;
-                star_s = si;
-            } else {
-                star_p = pi + 1;
-                star_s = si;
-                pi += 1;
-            }
-        } else if (star_p) |sp| {
-            pi = sp;
+            star_p = pi + 1;
+            star_s = si;
+            pi += 1;
+        } else if (star_p) |saved| {
+            pi = saved;
             star_s += 1;
             si = star_s;
         } else {
@@ -373,209 +585,42 @@ fn matchSimpleGlob(pattern: []const u8, str: []const u8) bool {
     return pi == pattern.len;
 }
 
-/// Walk a directory tree, respecting .gitignore, and call `callback` for each text file line.
-pub fn walkAndIndex(
-    allocator: Allocator,
-    root: []const u8,
-    model: *const embed_mod.EmbedModel,
-    index: *Index,
-    progress_fn: ?*const fn (usize) void,
-) !void {
-    var ignore = IgnoreFilter.init(allocator);
-    defer ignore.deinit();
-
-    // Load .gitignore from root
-    var gi_buf: [4096]u8 = undefined;
-    const gi_path = std.fmt.bufPrint(&gi_buf, "{s}/.gitignore", .{root}) catch null;
-    if (gi_path) |p| ignore.loadFile(p) catch {};
-
-    // Always ignore .git and .zbed directories
-    const git_pat = try allocator.dupe(u8, ".git");
-    try ignore.patterns.append(.{ .pattern = git_pat, .negation = false, .dir_only = true });
-    const zbed_pat = try allocator.dupe(u8, ".zbed");
-    try ignore.patterns.append(.{ .pattern = zbed_pat, .negation = false, .dir_only = true });
-
-    var dir = try std.fs.cwd().openDir(root, .{ .iterate = true });
-    defer dir.close();
-
-    try walkDir(allocator, dir, root, "", &ignore, model, index, progress_fn);
-}
-
-fn walkDir(
-    allocator: Allocator,
-    dir: std.fs.Dir,
-    root: []const u8,
-    rel_prefix: []const u8,
-    ignore: *const IgnoreFilter,
-    model: *const embed_mod.EmbedModel,
-    index: *Index,
-    progress_fn: ?*const fn (usize) void,
-) !void {
-    var iter = dir.iterate();
-    while (try iter.next()) |entry| {
-        // Build relative path
-        var rel_buf: [4096]u8 = undefined;
-        const rel_path = if (rel_prefix.len > 0)
-            try std.fmt.bufPrint(&rel_buf, "{s}/{s}", .{ rel_prefix, entry.name })
-        else
-            try std.fmt.bufPrint(&rel_buf, "{s}", .{entry.name});
-
-        if (ignore.shouldIgnore(rel_path)) continue;
-
-        switch (entry.kind) {
-            .directory => {
-                var subdir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
-                defer subdir.close();
-                try walkDir(allocator, subdir, root, rel_path, ignore, model, index, progress_fn);
-            },
-            .file => {
-                if (!isTextFile(entry.name)) continue;
-
-                // Build full path
-                var full_buf: [4096]u8 = undefined;
-                const full_path = if (root.len > 0)
-                    try std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ root, rel_path })
-                else
-                    rel_path;
-
-                indexFile(allocator, full_path, rel_path, model, index) catch continue;
-
-                if (progress_fn) |pf| pf(index.count());
-            },
-            else => {},
-        }
-    }
-}
-
-fn indexFile(
-    allocator: Allocator,
-    full_path: []const u8,
-    rel_path: []const u8,
-    model: *const embed_mod.EmbedModel,
-    index: *Index,
-) !void {
-    const file = try std.fs.cwd().openFile(full_path, .{});
-    defer file.close();
-
-    // Read file (up to 10 MB)
-    const data = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return;
-    defer allocator.free(data);
-
-    var emb_buf: [embed_mod.MAX_EMBED_DIM]f32 = undefined;
-    const dim = model.embed_dim;
-
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    var line_num: u32 = 0;
-    while (lines.next()) |line| {
-        line_num += 1;
-        // Skip very short or very long lines
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len < 3 or trimmed.len > 1200) continue;
-
-        const valid = model.embed(trimmed, emb_buf[0..dim]);
-        if (valid == 0) continue;
-
-        try index.addDocument(rel_path, line_num, trimmed, emb_buf[0..dim]);
-    }
-}
-
-// ─── tests ───────────────────────────────────────────────────────────
 test "index save and load round-trip" {
     const allocator = std.testing.allocator;
     var idx = Index.init(allocator, 4);
     defer idx.deinit();
 
-    const emb1 = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
-    const emb2 = [_]f32{ 5.0, 6.0, 7.0, 8.0 };
-    try idx.addDocument("test.txt", 1, "hello world", &emb1);
-    try idx.addDocument("test.txt", 2, "foo bar", &emb2);
+    const emb1 = [_]i8{ 1, 2, 3, 4 };
+    const emb2 = [_]i8{ 5, 6, 7, 8 };
+    try idx.addDocumentQuantized("test.txt", 0, "test.txt", .path, &emb1, 0.1, search_mod.quantizedNorm(&emb1));
+    try idx.addDocumentQuantized("test.txt", 2, "foo bar", .text, &emb2, 0.2, search_mod.quantizedNorm(&emb2));
 
-    // Save to temp dir
     const tmp_dir = "/tmp/zbed_test_idx";
     std.fs.cwd().makeDir(tmp_dir) catch {};
     defer std.fs.cwd().deleteTree(tmp_dir) catch {};
 
     try idx.save(tmp_dir);
 
-    // Load into new index
-    var idx2 = Index.init(allocator, 4);
+    var idx2 = Index.init(allocator, 1);
     defer idx2.deinit();
     try idx2.load(tmp_dir);
 
     try std.testing.expectEqual(@as(usize, 2), idx2.count());
     try std.testing.expectEqual(@as(usize, 4), idx2.dim);
-    try std.testing.expectEqualStrings("hello world", idx2.documents.items[0].content);
-    try std.testing.expectEqualStrings("foo bar", idx2.documents.items[1].content);
-    try std.testing.expectEqual(@as(u32, 1), idx2.documents.items[0].line_num);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), idx2.embeddings.items[0], 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 8.0), idx2.embeddings.items[7], 0.001);
+    try std.testing.expectEqual(DocumentKind.path, idx2.documents.items[0].kind);
+    try std.testing.expectEqual(DocumentKind.text, idx2.documents.items[1].kind);
+    try std.testing.expectEqual(@as(i8, 8), idx2.embeddings.items[7]);
 }
 
-test "gitignore pattern matching" {
+test "normalize path for search" {
     const allocator = std.testing.allocator;
-    var filter = IgnoreFilter.init(allocator);
-    defer filter.deinit();
-
-    const p1 = try allocator.dupe(u8, "*.log");
-    try filter.patterns.append(.{ .pattern = p1, .negation = false, .dir_only = false });
-    const p2 = try allocator.dupe(u8, "node_modules");
-    try filter.patterns.append(.{ .pattern = p2, .negation = false, .dir_only = true });
-    const p3 = try allocator.dupe(u8, "build");
-    try filter.patterns.append(.{ .pattern = p3, .negation = false, .dir_only = true });
-
-    try std.testing.expect(filter.shouldIgnore("debug.log"));
-    try std.testing.expect(filter.shouldIgnore("src/debug.log"));
-    try std.testing.expect(filter.shouldIgnore("node_modules"));
-    try std.testing.expect(!filter.shouldIgnore("src/main.go"));
+    const normalized = try normalizePathForSearch(allocator, "audio/My-File.opus");
+    defer allocator.free(normalized);
+    try std.testing.expectEqualStrings("audio my file opus", normalized);
 }
 
-test "isTextFile" {
+test "text file detection" {
     try std.testing.expect(isTextFile("main.go"));
-    try std.testing.expect(isTextFile("src/lib.rs"));
-    try std.testing.expect(isTextFile("Makefile"));
-    try std.testing.expect(isTextFile("README"));
-    try std.testing.expect(!isTextFile("image.png"));
-    try std.testing.expect(!isTextFile("binary.exe"));
-}
-
-test "gitignore negation patterns" {
-    const allocator = std.testing.allocator;
-    var filter = IgnoreFilter.init(allocator);
-    defer filter.deinit();
-
-    // Ignore all .log files, but not important.log
-    const p1 = try allocator.dupe(u8, "*.log");
-    try filter.patterns.append(.{ .pattern = p1, .negation = false, .dir_only = false });
-    const p2 = try allocator.dupe(u8, "important.log");
-    try filter.patterns.append(.{ .pattern = p2, .negation = true, .dir_only = false });
-
-    try std.testing.expect(filter.shouldIgnore("debug.log"));
-    try std.testing.expect(!filter.shouldIgnore("important.log"));
-}
-
-test "gitignore .git vs .github" {
-    const allocator = std.testing.allocator;
-    var filter = IgnoreFilter.init(allocator);
-    defer filter.deinit();
-
-    // Same patterns as walkAndIndex adds
-    const p1 = try allocator.dupe(u8, ".git");
-    try filter.patterns.append(.{ .pattern = p1, .negation = false, .dir_only = true });
-    const p2 = try allocator.dupe(u8, ".zbed");
-    try filter.patterns.append(.{ .pattern = p2, .negation = false, .dir_only = true });
-
-    try std.testing.expect(filter.shouldIgnore(".git"));
-    try std.testing.expect(filter.shouldIgnore(".zbed"));
-    try std.testing.expect(!filter.shouldIgnore(".github"));
-    try std.testing.expect(!filter.shouldIgnore("src/main.zig"));
-}
-
-test "glob matching with wildcards" {
-    try std.testing.expect(matchSimpleGlob("*.txt", "foo.txt"));
-    try std.testing.expect(!matchSimpleGlob("*.txt", "foo.rs"));
-    try std.testing.expect(matchSimpleGlob("test_*", "test_foo"));
-    try std.testing.expect(!matchSimpleGlob("test_*", "foo_test"));
-    try std.testing.expect(matchSimpleGlob("*", "anything"));
-    try std.testing.expect(matchSimpleGlob("a?c", "abc"));
-    try std.testing.expect(!matchSimpleGlob("a?c", "abbc"));
+    try std.testing.expect(!isTextFile("song.mp3"));
+    try std.testing.expect(isBinaryExtension("movie.mp4"));
 }

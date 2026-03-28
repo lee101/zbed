@@ -9,9 +9,17 @@ echo ""
 MODEL_DIR="model"
 MODEL_NAME="sentence-transformers/static-retrieval-mrl-en-v1"
 TOKENIZER_URL="https://huggingface.co/${MODEL_NAME}/resolve/main/0_StaticEmbedding/tokenizer.json"
+SIBLING_MODEL_DIR="../gobed/model"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+if ! command -v "$PYTHON_BIN" &> /dev/null; then
+    if command -v python &> /dev/null; then
+        PYTHON_BIN="python"
+    fi
+fi
 
 # Check for required tools
-for cmd in curl python3; do
+for cmd in curl "$PYTHON_BIN"; do
     if ! command -v "$cmd" &> /dev/null; then
         echo "Error: $cmd is required but not installed."
         exit 1
@@ -29,6 +37,15 @@ echo ""
 # Create model directory
 mkdir -p "$MODEL_DIR"
 
+# Reuse an existing sibling GoBed model when present.
+if [ -f "$SIBLING_MODEL_DIR/modelint8_512dim.safetensors" ] && [ ! -f "$MODEL_DIR/modelint8_512dim.safetensors" ]; then
+    echo "Reusing sibling model from $SIBLING_MODEL_DIR"
+    cp "$SIBLING_MODEL_DIR/modelint8_512dim.safetensors" "$MODEL_DIR/modelint8_512dim.safetensors"
+fi
+if [ -f "$SIBLING_MODEL_DIR/tokenizer.json" ] && [ ! -f "$MODEL_DIR/tokenizer.json" ]; then
+    cp "$SIBLING_MODEL_DIR/tokenizer.json" "$MODEL_DIR/tokenizer.json"
+fi
+
 # Download tokenizer.json
 if [ -f "$MODEL_DIR/tokenizer.json" ]; then
     echo "Tokenizer already downloaded ($MODEL_DIR/tokenizer.json)"
@@ -40,19 +57,19 @@ fi
 echo ""
 
 # Download and quantize model weights
-if [ -f "$MODEL_DIR/modelint8_256dim.safetensors" ] || [ -f "$MODEL_DIR/modelint8_512dim.safetensors" ]; then
+if [ -f "$MODEL_DIR/modelint8_512dim.safetensors" ] || [ -f "$MODEL_DIR/modelint8_256dim.safetensors" ]; then
     echo "Model weights already present."
 else
     echo "Downloading and quantizing model weights..."
     echo "This requires: pip install huggingface-hub safetensors torch numpy"
 
     # Install Python dependencies if needed
-    python3 -c "import huggingface_hub, safetensors, torch, numpy" 2>/dev/null || {
+    "$PYTHON_BIN" -c "import huggingface_hub, safetensors, torch, numpy" 2>/dev/null || {
         echo "Installing Python dependencies..."
-        pip3 install --quiet huggingface-hub safetensors torch numpy
+        "$PYTHON_BIN" -m pip install --quiet huggingface-hub safetensors torch numpy
     }
 
-    python3 - <<'PYEOF'
+    "$PYTHON_BIN" - <<'PYEOF'
 import os
 import numpy as np
 
@@ -92,8 +109,8 @@ try:
 
     vocab_size, full_dim = weights.shape
 
-    # Truncate to 256 dimensions for efficiency
-    dim = 256
+    # Keep the full 512-dim static embedding table.
+    dim = 512
     weights_trunc = weights[:, :dim].astype(np.float32)
     print(f"  Truncated to {dim} dimensions")
 
@@ -138,8 +155,8 @@ echo "==========================================================================
 echo ""
 echo "Usage:"
 echo "  zig build                    Build zbed"
-echo "  ./zig-out/bin/zbed index .   Index current directory"
-echo "  ./zig-out/bin/zbed <query>   Search for semantically similar code"
+echo "  ./zig-out/bin/bed index .    Index current directory"
+echo "  ./zig-out/bin/bed <query>    Search files and file contents"
 echo "  ./zig-out/bin/zbed bench     Run performance benchmark"
 echo "  ./zig-out/bin/zbed status    Show index statistics"
 echo ""

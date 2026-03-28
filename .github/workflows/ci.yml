@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup model
+        run: ./setup.sh
+
+      - name: Build
+        run: zig build --global-cache-dir .zig-global-cache
+
+      - name: Unit tests
+        run: zig build test --global-cache-dir .zig-global-cache
+
+      - name: Real inference smoke test
+        run: bash ci/smoke.sh

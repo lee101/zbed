@@ -1,122 +1,77 @@
 # zbed
 
-Fast semantic code search, powered by static embeddings. Pure Zig port of [gobed](https://github.com/lee101/gobed).
+`zbed` is a Zig port of the fast static-embedding path from `gobed`, now paired with a Zig `bed` CLI for semantic filesystem search.
 
-> **Primary repository**: [codex-infinity.com/lee101/zbed](https://codex-infinity.com/lee101/zbed) | GitHub mirror: [github.com/lee101/zbed](https://github.com/lee101/zbed)
+The core model is `sentence-transformers/static-retrieval-mrl-en-v1` in quantized `int8/512` form. Tokenization is WordPiece over `tokenizer.json`; inference is table lookup + mean pooling; search runs directly over quantized vectors.
 
-Uses int8 quantized embeddings from [sentence-transformers/static-retrieval-mrl-en-v1](https://huggingface.co/sentence-transformers/static-retrieval-mrl-en-v1) with SIMD-accelerated cosine similarity search via Zig's `@Vector`.
+## Binaries
+
+- `zbed`: model-oriented CLI for embedding, indexing, status, and benchmarks
+- `bed`: filesystem search CLI built on the same engine
 
 ## Features
 
-- **WordPiece tokenizer** — loads vocabulary from HuggingFace `tokenizer.json`
-- **Int8 quantized embeddings** — safetensors format, ~8x memory savings vs float32
-- **SIMD cosine similarity** — uses `@Vector` for vectorized dot products and embedding accumulation
-- **Flat brute-force search** — top-k results with min-heap and precomputed norms
-- **Persistent index** — `.zbed/index.bin` binary format for fast reload
-- **.gitignore-aware** — respects `.gitignore` patterns when walking directories
-- **Pure Zig stdlib** — no external dependencies
+- `int8/512` static embedding model loading from safetensors
+- low-allocation tokenizer and embedding scratch buffers
+- quantized flat search over persisted int8 vectors
+- text files indexed by filename and line content
+- binary/media files indexed by filename only when `--search-binaries` is enabled
+- `.gitignore`-aware directory walking
+- cross-platform Zig build for Linux, macOS, and Windows
 
-## Quick Start
+## Quick start
 
 ```bash
-# 1. Download model weights (~8 MB quantized)
 ./setup.sh
-
-# 2. Build
 zig build
 
-# 3. Index your codebase
-./zig-out/bin/zbed index .
-
-# 4. Search
-./zig-out/bin/zbed "error handling"
+./zig-out/bin/bed index . --search-binaries
+./zig-out/bin/bed "opus audio"
+./zig-out/bin/zbed embed "semantic file search"
 ```
 
-## Usage
+If `../gobed/model` already exists, `setup.sh` reuses that quantized model before downloading anything.
 
-```
-zbed <query>            Search indexed files for semantically similar lines
-zbed index [path]       Build semantic index for a directory (default: .)
-zbed bench              Run embedding benchmark
-zbed status [path]      Show index statistics
-zbed help               Show help message
-```
+## Commands
 
-### Options
+```text
+bed <query>                    Search indexed files and filenames
+bed index [path]               Build a quantized search index
+bed status [path]              Show index statistics
 
-```
--l, --limit N           Maximum results to show (default: 10)
--t, --threshold F       Similarity threshold 0.0-1.0 (default: 0.3)
--m, --model-dir DIR     Path to model directory (default: model/)
+zbed embed <text>              Run one embedding inference
+zbed bench                     Run embedding/search benchmarks
+zbed status [path]             Show index statistics
 ```
 
-### Environment Variables
+Useful flags:
 
-- `ZBED_MODEL_PATH` — override model directory location
-
-## Architecture
-
-```
-src/
-  tokenizer.zig   WordPiece BPE tokenizer from tokenizer.json
-  embed.zig       Safetensors int8 embeddings with SIMD @Vector
-  search.zig      Flat cosine similarity index with top-k heap
-  index.zig       .zbed/index.bin persistence + .gitignore-aware walk
-  main.zig        CLI: zbed QUERY, zbed index, zbed bench, zbed status
-  lib.zig         Public library API
+```text
+-p, --path PATH
+-l, --limit N
+-t, --threshold F
+-m, --model-dir DIR
+    --search-binaries
+    --gpu
 ```
 
-### How It Works
+`--gpu` is currently a request flag with CPU fallback. The build is structured so a Zig CUDA bridge can be linked in without changing the CLI surface.
 
-1. **Tokenization**: Text is lowercased, split into words, and each word is broken into subword tokens using the WordPiece algorithm (same as BERT).
+## Index semantics
 
-2. **Embedding**: Each token ID maps to a row in the int8 embedding table. The row is dequantized (`int8 * scale`) and accumulated. Mean pooling averages across all tokens to produce a single vector.
+- Text files produce one filename document plus one document per qualifying content line.
+- Binary files produce one filename-only document when `--search-binaries` is enabled.
+- Filename search text is normalized from the relative path, so `a.opus` becomes searchable via terms like `a` and `opus`.
 
-3. **Indexing**: Files are walked (respecting `.gitignore`), each line is embedded, and the resulting vectors plus metadata are serialized to `.zbed/index.bin`.
+## Build
 
-4. **Search**: The query is embedded, then cosine similarity is computed against every indexed line using SIMD-accelerated dot products. A min-heap maintains the top-k results.
-
-### SIMD
-
-Embedding accumulation and cosine similarity both use Zig's `@Vector(8, f32)` for 8-wide SIMD operations. This maps to SSE/AVX on x86 and NEON on ARM, with automatic scalar fallback.
-
-## Model
-
-The default model is [static-retrieval-mrl-en-v1](https://huggingface.co/sentence-transformers/static-retrieval-mrl-en-v1), a static embedding model (no neural network inference — just table lookups + mean pooling). The setup script downloads and quantizes it to int8 with per-token scaling.
-
-| Property | Value |
-|----------|-------|
-| Dimensions | 256 (truncated from 1024) |
-| Vocab size | 30,522 |
-| Format | safetensors (int8 + f32 scales) |
-| Size | ~8 MB |
-
-## Building
-
-Requires Zig 0.13.0+.
+Requires Zig `0.15.x`.
 
 ```bash
-zig build              # debug build
-zig build -Doptimize=ReleaseFast  # optimized build
-zig build test         # run unit tests
+zig build --global-cache-dir .zig-global-cache
+zig build test --global-cache-dir .zig-global-cache
 ```
 
-## Testing
+## CI
 
-```bash
-zig build test
-```
-
-Tests cover:
-- WordPiece tokenization and subword splitting
-- Int8 quantization round-trip accuracy
-- Embedding computation with SIMD
-- Cosine similarity (identical, orthogonal, opposite vectors)
-- Flat index search correctness
-- Index save/load round-trip
-- .gitignore pattern matching
-- Text file detection
-
-## License
-
-MIT
+The included CI workflow installs Zig, runs `./setup.sh`, builds both binaries, runs unit tests, and performs real model-backed smoke inference/search on Linux, macOS, and Windows.
