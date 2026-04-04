@@ -155,7 +155,7 @@ fn tryLoadModel(allocator: std.mem.Allocator, opts: ParsedOptions) !EmbedModel {
 
 fn loadModel(allocator: std.mem.Allocator, opts: ParsedOptions) !EmbedModel {
     return tryLoadModel(allocator, opts) catch {
-        try stderr().print("Error: model not found. Run ./setup.sh or set ZBED_MODEL_PATH.\n", .{});
+        try stderr().print("Error: model not found. Ensure ./model/ exists or set ZBED_MODEL_PATH.\n", .{});
         std.process.exit(1);
     };
 }
@@ -399,7 +399,7 @@ fn cmdBench(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const opts = parseCommonOptions(args, 2);
 
     var model = tryLoadModel(allocator, opts) catch {
-        try stderr().print("Model not available. Run ./setup.sh for full inference benchmarks.\n", .{});
+        try stderr().print("Model not available. Ensure ./model/ exists for full inference benchmarks.\n", .{});
         return;
     };
     defer model.deinit();

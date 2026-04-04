@@ -49,31 +49,45 @@ pub fn cosineSimilarity(a: []const f32, b: []const f32) f32 {
 pub fn quantizedNorm(vec: []const i8) f32 {
     if (vec.len == 0) return 0;
 
-    var sum: i64 = 0;
+    var acc: VecI32x16 = @splat(0);
     var i: usize = 0;
-    while (i + 16 <= vec.len) : (i += 16) {
-        inline for (0..16) |j| {
-            const v: i32 = vec[i + j];
-            sum += @as(i64, v * v);
-        }
+    while (i + SIMD_I8_WIDTH <= vec.len) : (i += SIMD_I8_WIDTH) {
+        const v: VecI16x16 = @as(VecI8x16, vec[i..][0..SIMD_I8_WIDTH].*);
+        acc += @as(VecI32x16, v * v);
     }
+    var sum: i32 = @reduce(.Add, acc);
     while (i < vec.len) : (i += 1) {
         const v: i32 = vec[i];
-        sum += @as(i64, v * v);
+        sum += v * v;
     }
     return @sqrt(@as(f32, @floatFromInt(sum)));
 }
 
+const SIMD_I8_WIDTH = 16;
+const VecI8x16 = @Vector(SIMD_I8_WIDTH, i8);
+const VecI16x16 = @Vector(SIMD_I8_WIDTH, i16);
+const VecI32x16 = @Vector(SIMD_I8_WIDTH, i32);
+
 pub fn dotInt8(a: []const i8, b: []const i8) i32 {
     const dim = @min(a.len, b.len);
-    var sum: i32 = 0;
     var i: usize = 0;
 
+    var acc0: VecI32x16 = @splat(0);
+    var acc1: VecI32x16 = @splat(0);
     while (i + 32 <= dim) : (i += 32) {
-        inline for (0..32) |j| {
-            sum += @as(i32, a[i + j]) * @as(i32, b[i + j]);
-        }
+        const a0: VecI16x16 = @as(VecI8x16, a[i..][0..SIMD_I8_WIDTH].*);
+        const b0: VecI16x16 = @as(VecI8x16, b[i..][0..SIMD_I8_WIDTH].*);
+        const a1: VecI16x16 = @as(VecI8x16, a[i + SIMD_I8_WIDTH ..][0..SIMD_I8_WIDTH].*);
+        const b1: VecI16x16 = @as(VecI8x16, b[i + SIMD_I8_WIDTH ..][0..SIMD_I8_WIDTH].*);
+        acc0 += @as(VecI32x16, a0 * b0);
+        acc1 += @as(VecI32x16, a1 * b1);
     }
+    while (i + SIMD_I8_WIDTH <= dim) : (i += SIMD_I8_WIDTH) {
+        const va: VecI16x16 = @as(VecI8x16, a[i..][0..SIMD_I8_WIDTH].*);
+        const vb: VecI16x16 = @as(VecI8x16, b[i..][0..SIMD_I8_WIDTH].*);
+        acc0 += @as(VecI32x16, va * vb);
+    }
+    var sum: i32 = @reduce(.Add, acc0) + @reduce(.Add, acc1);
     while (i < dim) : (i += 1) {
         sum += @as(i32, a[i]) * @as(i32, b[i]);
     }

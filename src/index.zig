@@ -98,27 +98,25 @@ pub const Index = struct {
         return self.documents.items.len;
     }
 
-    /// Remove all documents with the given file_path. Returns number removed.
     pub fn removeByPath(self: *Index, path: []const u8) usize {
-        var removed: usize = 0;
-        var i: usize = 0;
-        while (i < self.documents.items.len) {
-            if (std.mem.eql(u8, self.documents.items[i].file_path, path)) {
-                _ = self.documents.orderedRemove(i);
-                _ = self.scales.orderedRemove(i);
-                _ = self.norms.orderedRemove(i);
-                // Remove dim-sized embedding slice
-                const start = i * self.dim;
-                const end = start + self.dim;
-                if (end <= self.embeddings.items.len) {
-                    std.mem.copyForwards(i8, self.embeddings.items[start..], self.embeddings.items[end..]);
-                    self.embeddings.items.len -= self.dim;
-                }
-                removed += 1;
-            } else {
-                i += 1;
+        var write: usize = 0;
+        for (0..self.documents.items.len) |read| {
+            if (std.mem.eql(u8, self.documents.items[read].file_path, path)) continue;
+            if (write != read) {
+                self.documents.items[write] = self.documents.items[read];
+                self.scales.items[write] = self.scales.items[read];
+                self.norms.items[write] = self.norms.items[read];
+                const dst = self.embeddings.items[write * self.dim ..][0..self.dim];
+                const src = self.embeddings.items[read * self.dim ..][0..self.dim];
+                @memcpy(dst, src);
             }
+            write += 1;
         }
+        const removed = self.documents.items.len - write;
+        self.documents.items.len = write;
+        self.scales.items.len = write;
+        self.norms.items.len = write;
+        self.embeddings.items.len = write * self.dim;
         return removed;
     }
 
