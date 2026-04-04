@@ -21,16 +21,14 @@ The core model is `sentence-transformers/static-retrieval-mrl-en-v1` in quantize
 
 ## Quick start
 
-```bash
-./setup.sh
-zig build
+The quantized model (`int8/512`, ~16 MB) is bundled in `model/`. No setup script needed.
 
+```bash
+zig build
 ./zig-out/bin/bed index . --search-binaries
 ./zig-out/bin/bed "opus audio"
 ./zig-out/bin/zbed embed "semantic file search"
 ```
-
-If `../gobed/model` already exists, `setup.sh` reuses that quantized model before downloading anything.
 
 ## Commands
 

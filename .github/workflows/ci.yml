@@ -23,13 +23,6 @@ jobs:
         with:
           version: 0.15.2
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Setup model
-        run: ./setup.sh
-
       - name: Build
         run: zig build --global-cache-dir .zig-global-cache
 
