@@ -7,7 +7,6 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        "bed",
         "ci",
         ".github",
         "README.md",

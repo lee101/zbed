@@ -16,10 +16,8 @@ if [[ ! -d "${ZBED_MODEL_PATH:-}" ]]; then
   exit 1
 fi
 
-BED_BIN="./zig-out/bin/bed"
 ZBED_BIN="./zig-out/bin/zbed"
-if [[ -x "./zig-out/bin/bed.exe" ]]; then
-  BED_BIN="./zig-out/bin/bed.exe"
+if [[ -x "./zig-out/bin/zbed.exe" ]]; then
   ZBED_BIN="./zig-out/bin/zbed.exe"
 fi
 
@@ -32,11 +30,11 @@ semantic search line
 EOF
 printf 'binary-ish' >"$tmpdir/a.opus"
 
-"$ZBED_BIN" embed "audio file search mp3 opus mp4" >/dev/null
-"$BED_BIN" index "$tmpdir" --search-binaries >/dev/null
+"$ZBED_BIN" bench >/dev/null
+"$ZBED_BIN" index "$tmpdir" --search-binaries >/dev/null
 
-semantic_out="$("$BED_BIN" "semantic search" --path "$tmpdir" --search-binaries)"
-audio_out="$("$BED_BIN" "opus audio" --path "$tmpdir" --search-binaries)"
+semantic_out="$("$ZBED_BIN" "semantic search" --path "$tmpdir" --search-binaries)"
+audio_out="$("$ZBED_BIN" "opus audio" --path "$tmpdir" --search-binaries)"
 
 printf '%s\n' "$semantic_out" | grep -q "semantic search line"
 printf '%s\n' "$audio_out" | grep -q "binary filename: a.opus"
