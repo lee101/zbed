@@ -1,7 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const embed_mod = @import("embed.zig");
-const gpu_mod = @import("gpu.zig");
 const search_mod = @import("search.zig");
 
 const INDEX_MAGIC: u32 = 0x5A424544;
@@ -26,7 +25,6 @@ pub const WalkOptions = struct {
     min_line_length: usize = 3,
     max_line_length: usize = 1200,
     include_path_documents: bool = true,
-    gpu_embedder: ?*gpu_mod.GpuEmbedder = null,
 };
 
 pub const CountSummary = struct {
@@ -303,23 +301,22 @@ fn readString(file: std.fs.File, allocator: Allocator) ![]const u8 {
 }
 
 const TEXT_EXTENSIONS = [_][]const u8{
-    ".txt", ".md", ".rst", ".tex", ".go", ".py", ".js", ".ts", ".jsx", ".tsx",
-    ".c", ".cpp", ".h", ".hpp", ".rs", ".rb", ".php", ".java", ".cs", ".swift",
-    ".kt", ".scala", ".zig", ".lua", ".json", ".yaml", ".yml", ".toml", ".ini",
-    ".conf", ".cfg", ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd",
-    ".sql", ".graphql", ".proto", ".html", ".css", ".scss", ".sass", ".less",
-    ".xml", ".dockerfile", ".gitignore",
+    ".txt",   ".md",    ".rst",  ".tex",  ".go",   ".py",   ".js",  ".ts",         ".jsx",       ".tsx",
+    ".c",     ".cpp",   ".h",    ".hpp",  ".rs",   ".rb",   ".php", ".java",       ".cs",        ".swift",
+    ".kt",    ".scala", ".zig",  ".lua",  ".json", ".yaml", ".yml", ".toml",       ".ini",       ".conf",
+    ".cfg",   ".sh",    ".bash", ".zsh",  ".fish", ".ps1",  ".bat", ".cmd",        ".sql",       ".graphql",
+    ".proto", ".html",  ".css",  ".scss", ".sass", ".less", ".xml", ".dockerfile", ".gitignore",
 };
 
 const BINARY_EXTENSIONS = [_][]const u8{
-    ".exe", ".dll", ".so", ".dylib", ".o", ".a", ".zip", ".tar", ".gz", ".7z",
-    ".rar", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico", ".pdf",
-    ".mp3", ".opus", ".flac", ".wav", ".m4a", ".aac", ".mp4", ".m4v", ".avi",
-    ".mov", ".mkv", ".webm", ".ttf", ".woff", ".woff2", ".db", ".sqlite",
+    ".exe",  ".dll",  ".so",   ".dylib", ".o",   ".a",      ".zip",  ".tar", ".gz",  ".7z",
+    ".rar",  ".jpg",  ".jpeg", ".png",   ".gif", ".bmp",    ".webp", ".ico", ".pdf", ".mp3",
+    ".opus", ".flac", ".wav",  ".m4a",   ".aac", ".mp4",    ".m4v",  ".avi", ".mov", ".mkv",
+    ".webm", ".ttf",  ".woff", ".woff2", ".db",  ".sqlite",
 };
 
 const DEFAULT_IGNORES = [_][]const u8{
-    ".git", ".zbed", ".bed", "node_modules", "vendor", "dist", "build", "target",
+    ".git",   ".zbed",       ".bed",  "node_modules", "vendor", "dist", "build", "target",
     ".cache", "__pycache__", ".venv", "model",
 };
 
@@ -405,14 +402,12 @@ fn walkDir(
 }
 
 fn indexBinaryFile(allocator: Allocator, rel_path: []const u8, model: *const embed_mod.EmbedModel, index: *Index, options: WalkOptions, scratch: *embed_mod.EmbedScratch, quantized: *embed_mod.QuantizedEmbedding) !void {
+    _ = options;
     const display_name = std.fs.path.basename(rel_path);
     const search_text = try normalizePathForSearch(allocator, rel_path);
     defer allocator.free(search_text);
 
-    const valid = if (options.gpu_embedder) |gpu_embedder|
-        try gpu_embedder.embedQuantized(model, search_text, scratch, quantized)
-    else
-        model.embedQuantizedWithScratch(search_text, scratch, quantized);
+    const valid = model.embedQuantizedWithScratch(search_text, scratch, quantized);
     if (valid == 0) return;
 
     try index.addDocumentQuantized(rel_path, 0, display_name, .binary, quantized.data[0..model.embed_dim], quantized.scale, quantized.norm);
@@ -424,10 +419,7 @@ fn indexTextFile(allocator: Allocator, full_path: []const u8, rel_path: []const 
         const search_text = try normalizePathForSearch(allocator, rel_path);
         defer allocator.free(search_text);
 
-        const valid = if (options.gpu_embedder) |gpu_embedder|
-            try gpu_embedder.embedQuantized(model, search_text, scratch, quantized)
-        else
-            model.embedQuantizedWithScratch(search_text, scratch, quantized);
+        const valid = model.embedQuantizedWithScratch(search_text, scratch, quantized);
         if (valid > 0) {
             try index.addDocumentQuantized(rel_path, 0, display_name, .path, quantized.data[0..model.embed_dim], quantized.scale, quantized.norm);
         }
@@ -446,10 +438,7 @@ fn indexTextFile(allocator: Allocator, full_path: []const u8, rel_path: []const 
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len < options.min_line_length) continue;
         if (trimmed.len > options.max_line_length) continue;
-        const valid = if (options.gpu_embedder) |gpu_embedder|
-            try gpu_embedder.embedQuantized(model, trimmed, scratch, quantized)
-        else
-            model.embedQuantizedWithScratch(trimmed, scratch, quantized);
+        const valid = model.embedQuantizedWithScratch(trimmed, scratch, quantized);
         if (valid == 0) continue;
 
         try index.addDocumentQuantized(rel_path, line_num, trimmed, .text, quantized.data[0..model.embed_dim], quantized.scale, quantized.norm);

@@ -1,8 +1,6 @@
 const std = @import("std");
 const zbed = @import("zbed");
-const gpu = zbed.gpu;
 const EmbedModel = zbed.EmbedModel;
-const EmbedScratch = zbed.EmbedScratch;
 const Index = zbed.Index;
 const QuantizedEmbedding = zbed.QuantizedEmbedding;
 const SearchResult = zbed.SearchResult;
@@ -16,7 +14,6 @@ const ParsedOptions = struct {
     threshold: f32 = 0.3,
     model_dir: ?[]const u8 = null,
     search_binaries: bool = false,
-    use_gpu: bool = false,
 };
 
 pub fn runCli(program_name: []const u8) !void {
@@ -39,10 +36,6 @@ pub fn runCli(program_name: []const u8) !void {
         try cmdStatus(allocator, args);
     } else if (std.mem.eql(u8, command, "bench")) {
         try cmdBench(allocator, args);
-    } else if (std.mem.eql(u8, command, "embed")) {
-        try cmdEmbed(allocator, program_name, args);
-    } else if (std.mem.eql(u8, command, "serve")) {
-        try cmdServe(allocator, args);
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         printUsage(program_name);
     } else {
@@ -66,8 +59,6 @@ fn printUsage(program_name: []const u8) void {
         \\  {s} <query>              Search indexed files and file names
         \\  {s} index [path]         Build a quantized search index
         \\  {s} status [path]        Show index statistics
-        \\  {s} embed <text>         Run one real embedding inference
-        \\  {s} serve [--port N]      HTTP server with inotify live reindex
         \\  {s} bench                Run local embedding/search benchmarks
         \\  {s} help                 Show this help message
         \\
@@ -77,16 +68,8 @@ fn printUsage(program_name: []const u8) void {
         \\  -t, --threshold F        Similarity threshold (default: 0.3)
         \\  -m, --model-dir DIR      Path to model directory
         \\      --search-binaries    Index binary/media files by filename only
-        \\      --gpu                Request GPU backend when available
         \\
-        \\Server endpoints:
-        \\  POST /search             {{"query":"text","k":10}}
-        \\  POST /index              {{"documents":[{{"text":"...","id":1}}]}}
-        \\  POST /rebuild            Full reindex from filesystem
-        \\  POST /similarity         {{"text1":"a","text2":"b"}}
-        \\  GET  /status             Index stats + watch status
-        \\
-    , .{ program_name, program_name, program_name, program_name, program_name, program_name, program_name, program_name }) catch {};
+    , .{ program_name, program_name, program_name, program_name, program_name, program_name }) catch {};
 }
 
 fn parseCommonOptions(args: []const []const u8, start_idx: usize) ParsedOptions {
@@ -108,8 +91,6 @@ fn parseCommonOptions(args: []const []const u8, start_idx: usize) ParsedOptions 
             i += 1;
         } else if (std.mem.eql(u8, arg, "--search-binaries")) {
             opts.search_binaries = true;
-        } else if (std.mem.eql(u8, arg, "--gpu")) {
-            opts.use_gpu = true;
         }
     }
     return opts;
@@ -160,36 +141,9 @@ fn loadModel(allocator: std.mem.Allocator, opts: ParsedOptions) !EmbedModel {
     };
 }
 
-fn maybeReportGpuFallback(opts: ParsedOptions) !void {
-    if (opts.use_gpu) {
-        if (!gpu.cudaEnabled()) {
-            try stderr().print("GPU backend requested, but this build was compiled without CUDA support. Rebuild with -Dcuda=true.\n", .{});
-        } else if (!gpu.isAvailable()) {
-            try stderr().print("GPU backend requested, but no CUDA device/backend is currently available. Using CPU path.\n", .{});
-        }
-    }
-}
-
-fn initGpuEmbedder(model: *const EmbedModel) ?gpu.GpuEmbedder {
-    if (!gpu.isAvailable() or model.embed_dim != 512) return null;
-    return gpu.GpuEmbedder.init(model) catch |err| {
-        stderr().print("GPU embedder init failed: {s} ({})\n", .{ gpu.lastErrorMessage(), err }) catch {};
-        return null;
-    };
-}
-
-fn initGpuSearchIndex(allocator: std.mem.Allocator, idx: *const Index) ?gpu.GpuSearchIndex {
-    if (!gpu.isAvailable() or idx.dim != 512) return null;
-    return gpu.GpuSearchIndex.init(allocator, idx) catch |err| {
-        stderr().print("GPU search init failed: {s} ({})\n", .{ gpu.lastErrorMessage(), err }) catch {};
-        return null;
-    };
-}
-
 fn cmdSearch(allocator: std.mem.Allocator, program_name: []const u8, args: []const []const u8) !void {
     _ = program_name;
     const opts = parseCommonOptions(args, 1);
-    try maybeReportGpuFallback(opts);
 
     var query_parts: std.ArrayListUnmanaged([]const u8) = .{};
     defer query_parts.deinit(allocator);
@@ -223,15 +177,12 @@ fn cmdSearch(allocator: std.mem.Allocator, program_name: []const u8, args: []con
 
     var idx = Index.init(allocator, model.embed_dim);
     defer idx.deinit();
-    var index_gpu_embedder = if (opts.use_gpu) initGpuEmbedder(&model) else null;
-    defer if (index_gpu_embedder) |*gpu_embedder| gpu_embedder.deinit();
 
     if (Index.exists(opts.target_path)) {
         try idx.load(opts.target_path);
     } else {
         const walk_opts = WalkOptions{
             .search_binaries = opts.search_binaries,
-            .gpu_embedder = if (index_gpu_embedder) |*gpu_embedder| gpu_embedder else null,
         };
         try stderr().print("No index found. Building one for {s}...\n", .{opts.target_path});
         try zbed.index.walkAndIndex(allocator, opts.target_path, &model, &idx, walk_opts, null);
@@ -244,39 +195,22 @@ fn cmdSearch(allocator: std.mem.Allocator, program_name: []const u8, args: []con
     }
 
     var query_embedding = QuantizedEmbedding{};
-    var maybe_gpu_embedder = if (opts.use_gpu) initGpuEmbedder(&model) else null;
-    defer if (maybe_gpu_embedder) |*gpu_embedder| gpu_embedder.deinit();
-    var query_scratch = EmbedScratch{};
 
-    const valid_tokens = if (maybe_gpu_embedder) |*gpu_embedder|
-        gpu_embedder.embedQuantized(&model, query, &query_scratch, &query_embedding) catch 0
-    else
-        model.embedQuantized(query, &query_embedding);
+    const valid_tokens = model.embedQuantized(query, &query_embedding);
     if (valid_tokens == 0) {
         try stdout().print("Query produced no valid tokens.\n", .{});
         return;
     }
 
     const search_index = idx.buildSearchIndex();
-    var maybe_gpu_search = if (opts.use_gpu) initGpuSearchIndex(allocator, &idx) else null;
-    defer if (maybe_gpu_search) |*gpu_search| gpu_search.deinit();
     var results: [MAX_RESULTS]SearchResult = undefined;
-    const n_results = if (maybe_gpu_search) |*gpu_search|
-        gpu_search.search(&query_embedding, @min(opts.limit, MAX_RESULTS), opts.threshold, &results) catch search_index.search(
-            query_embedding.data[0..model.embed_dim],
-            query_embedding.norm,
-            @min(opts.limit, MAX_RESULTS),
-            opts.threshold,
-            &results,
-        )
-    else
-        search_index.search(
-            query_embedding.data[0..model.embed_dim],
-            query_embedding.norm,
-            @min(opts.limit, MAX_RESULTS),
-            opts.threshold,
-            &results,
-        );
+    const n_results = search_index.search(
+        query_embedding.data[0..model.embed_dim],
+        query_embedding.norm,
+        @min(opts.limit, MAX_RESULTS),
+        opts.threshold,
+        &results,
+    );
 
     if (n_results == 0) {
         try stdout().print("No results found above threshold {d:.2}.\n", .{opts.threshold});
@@ -297,7 +231,6 @@ fn cmdSearch(allocator: std.mem.Allocator, program_name: []const u8, args: []con
 fn cmdIndex(allocator: std.mem.Allocator, program_name: []const u8, args: []const []const u8) !void {
     _ = program_name;
     var opts = parseCommonOptions(args, 2);
-    try maybeReportGpuFallback(opts);
 
     if (args.len > 2 and args[2].len > 0 and args[2][0] != '-') opts.target_path = args[2];
 
@@ -310,12 +243,8 @@ fn cmdIndex(allocator: std.mem.Allocator, program_name: []const u8, args: []cons
     var idx = Index.init(allocator, model.embed_dim);
     defer idx.deinit();
 
-    var maybe_gpu_embedder = if (opts.use_gpu) initGpuEmbedder(&model) else null;
-    defer if (maybe_gpu_embedder) |*gpu_embedder| gpu_embedder.deinit();
-
     const walk_opts = WalkOptions{
         .search_binaries = opts.search_binaries,
-        .gpu_embedder = if (maybe_gpu_embedder) |*gpu_embedder| gpu_embedder else null,
     };
     const progress = struct {
         fn callback(count: usize) void {
@@ -363,38 +292,6 @@ fn cmdStatus(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try stdout().print("  quantized embedding store: {d:.2} MB\n", .{quant_mb});
 }
 
-fn cmdEmbed(allocator: std.mem.Allocator, program_name: []const u8, args: []const []const u8) !void {
-    const opts = parseCommonOptions(args, 2);
-    try maybeReportGpuFallback(opts);
-
-    if (args.len < 3) {
-        printUsage(program_name);
-        return;
-    }
-
-    const text = args[2];
-    var model = try loadModel(allocator, opts);
-    defer model.deinit();
-
-    var quantized = QuantizedEmbedding{};
-    var maybe_gpu_embedder = if (opts.use_gpu) initGpuEmbedder(&model) else null;
-    defer if (maybe_gpu_embedder) |*gpu_embedder| gpu_embedder.deinit();
-
-    var scratch = EmbedScratch{};
-    const valid = if (maybe_gpu_embedder) |*gpu_embedder|
-        gpu_embedder.embedQuantized(&model, text, &scratch, &quantized) catch model.embedQuantized(text, &quantized)
-    else
-        model.embedQuantized(text, &quantized);
-    try stdout().print("tokens={d} dim={d} scale={d:.6} norm={d:.3}\n", .{ valid, model.embed_dim, quantized.scale, quantized.norm });
-    try stdout().print("first16=", .{});
-    const show = @min(model.embed_dim, 16);
-    for (quantized.data[0..show], 0..) |value, i| {
-        if (i != 0) try stdout().print(",", .{});
-        try stdout().print("{d}", .{value});
-    }
-    try stdout().print("\n", .{});
-}
-
 fn cmdBench(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const opts = parseCommonOptions(args, 2);
 
@@ -431,30 +328,6 @@ fn cmdBench(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const us_per = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(total)) / 1000.0;
     try stdout().print("CPU embedding benchmark: {d} runs, {d:.1} us/embed (checksum={d})\n", .{ total, us_per, cpu_embed_checksum });
 
-    if (opts.use_gpu and gpu.isAvailable() and model.embed_dim == 512) {
-        if (gpu.deviceName(allocator, 0) catch null) |name| {
-            defer allocator.free(name);
-            try stdout().print("CUDA device: {s}\n", .{name});
-        }
-
-        var gpu_embedder = initGpuEmbedder(&model) orelse return;
-        defer gpu_embedder.deinit();
-        var scratch = EmbedScratch{};
-        var gpu_embed_checksum: i64 = 0;
-
-        timer.reset();
-        for (0..iters) |_| {
-            for (texts) |text| {
-                const valid = gpu_embedder.embedQuantized(&model, text, &scratch, &quantized) catch 0;
-                gpu_embed_checksum += @intCast(valid);
-                gpu_embed_checksum += quantized.data[0];
-                gpu_embed_checksum += quantized.data[1];
-            }
-        }
-        const gpu_embed_us = @as(f64, @floatFromInt(timer.read())) / @as(f64, @floatFromInt(total)) / 1000.0;
-        try stdout().print("GPU embedding benchmark: {d} runs, {d:.1} us/embed (checksum={d})\n", .{ total, gpu_embed_us, gpu_embed_checksum });
-    }
-
     var idx = Index.init(allocator, model.embed_dim);
     defer idx.deinit();
     for (texts, 0..) |text, i| {
@@ -474,61 +347,4 @@ fn cmdBench(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
     const search_us = @as(f64, @floatFromInt(timer.read())) / 1000.0 / 1000.0;
     try stdout().print("CPU search benchmark: 1000 runs, {d:.1} us/search (checksum={d:.3})\n", .{ search_us, cpu_search_checksum });
-
-    if (opts.use_gpu and gpu.isAvailable() and idx.dim == 512) {
-        var gpu_search = initGpuSearchIndex(allocator, &idx) orelse return;
-        defer gpu_search.deinit();
-        var gpu_embedder = initGpuEmbedder(&model) orelse return;
-        defer gpu_embedder.deinit();
-        var scratch = EmbedScratch{};
-        var gpu_search_checksum: f64 = 0;
-
-        timer.reset();
-        for (0..1000) |_| {
-            _ = gpu_embedder.embedQuantized(&model, "binary filename audio search", &scratch, &quantized) catch 0;
-            const found = gpu_search.search(&quantized, 3, 0.0, &results) catch 0;
-            gpu_search_checksum += @floatFromInt(found);
-            if (found > 0) gpu_search_checksum += results[0].score;
-        }
-        const gpu_search_us = @as(f64, @floatFromInt(timer.read())) / 1000.0 / 1000.0;
-        try stdout().print("GPU search benchmark: 1000 runs, {d:.1} us/search (checksum={d:.3})\n", .{ gpu_search_us, gpu_search_checksum });
-    }
-}
-
-fn cmdServe(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    const opts = parseCommonOptions(args, 2);
-    try maybeReportGpuFallback(opts);
-
-    var port: u16 = 8080;
-    var i: usize = 2;
-    while (i < args.len) : (i += 1) {
-        if ((std.mem.eql(u8, args[i], "--port") or std.mem.eql(u8, args[i], "-P")) and i + 1 < args.len) {
-            port = std.fmt.parseInt(u16, args[i + 1], 10) catch 8080;
-            i += 1;
-        }
-    }
-
-    var model = try loadModel(allocator, opts);
-    defer model.deinit();
-
-    var idx = Index.init(allocator, model.embed_dim);
-    defer idx.deinit();
-
-    if (Index.exists(opts.target_path)) {
-        try stderr().print("Loading index from {s}/.zbed/index.bin\n", .{opts.target_path});
-        try idx.load(opts.target_path);
-        try stderr().print("{d} docs loaded\n", .{idx.count()});
-    } else {
-        try stderr().print("Building index for {s}...\n", .{opts.target_path});
-        const walk_opts = WalkOptions{ .search_binaries = opts.search_binaries };
-        try zbed.index.walkAndIndex(allocator, opts.target_path, &model, &idx, walk_opts, null);
-        try idx.save(opts.target_path);
-        try stderr().print("{d} docs indexed\n", .{idx.count()});
-    }
-
-    const walk_opts = WalkOptions{ .search_binaries = opts.search_binaries };
-    var state = zbed.ServerState.init(allocator, &model, &idx, opts.target_path, walk_opts);
-    defer state.deinit();
-
-    try zbed.server.run(allocator, &state, port);
 }

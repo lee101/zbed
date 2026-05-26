@@ -1,77 +1,94 @@
 # zbed
 
-`zbed` is a Zig port of the fast static-embedding path from `gobed`, now paired with a Zig `bed` CLI for semantic filesystem search.
-
-The core model is `sentence-transformers/static-retrieval-mrl-en-v1` in quantized `int8/512` form. Tokenization is WordPiece over `tokenizer.json`; inference is table lookup + mean pooling; search runs directly over quantized vectors.
-
-## Binaries
-
-- `zbed`: model-oriented CLI for embedding, indexing, status, and benchmarks
-- `bed`: filesystem search CLI built on the same engine
+`zbed` is a pure Zig port of the core filesystem search path from
+[`lee101/gobed`](https://github.com/lee101/gobed). It uses the
+`sentence-transformers/static-retrieval-mrl-en-v1` static embedding model,
+quantized to int8 safetensors, to embed file paths and text lines into a flat
+cosine similarity index.
 
 ## Features
 
-- `int8/512` static embedding model loading from safetensors
-- low-allocation tokenizer and embedding scratch buffers
-- quantized flat search over persisted int8 vectors
-- text files indexed by filename and line content
-- binary/media files indexed by filename only when `--search-binaries` is enabled
+- WordPiece tokenization from `tokenizer.json`
+- int8 safetensors embedding table loading
+- mean-pooled embeddings with `@Vector` SIMD accumulation
+- flat top-k cosine similarity search
+- persisted `.zbed/index.bin` index files
 - `.gitignore`-aware directory walking
-- cross-platform Zig build for Linux, macOS, and Windows
+- text files indexed by filename and matching content lines
+- optional binary/media filename indexing with `--search-binaries`
+- only Zig standard library dependencies
 
-## Quick start
+## Setup
+
+Install Zig 0.15 or newer, then download and quantize the model:
 
 ```bash
 ./setup.sh
-zig build
-
-./zig-out/bin/bed index . --search-binaries
-./zig-out/bin/bed "opus audio"
-./zig-out/bin/zbed embed "semantic file search"
 ```
 
-If `../gobed/model` already exists, `setup.sh` reuses that quantized model before downloading anything.
+The setup script downloads:
 
-## Commands
+- `0_StaticEmbedding/tokenizer.json`
+- `0_StaticEmbedding/model.safetensors`
+
+It writes a compact quantized model to:
 
 ```text
-bed <query>                    Search indexed files and filenames
-bed index [path]               Build a quantized search index
-bed status [path]              Show index statistics
+model/modelint8_512dim.safetensors
+```
 
-zbed embed <text>              Run one embedding inference
-zbed bench                     Run embedding/search benchmarks
-zbed status [path]             Show index statistics
+You can also set `ZBED_MODEL_PATH` to a directory containing `tokenizer.json`
+and a supported safetensors file.
+
+## Build And Test
+
+```bash
+zig build
+zig build test
+```
+
+The binary is installed at:
+
+```text
+zig-out/bin/zbed
+```
+
+## CLI
+
+```text
+zbed QUERY                  Search the index in the current directory
+zbed index [PATH]           Build PATH/.zbed/index.bin
+zbed status [PATH]          Print index statistics
+zbed bench                  Run embedding and search benchmarks
 ```
 
 Useful flags:
 
 ```text
--p, --path PATH
--l, --limit N
--t, --threshold F
--m, --model-dir DIR
-    --search-binaries
-    --gpu
+-p, --path PATH             Search/index path
+-l, --limit N               Maximum results
+-t, --threshold F           Similarity threshold
+-m, --model-dir DIR         Model directory
+    --search-binaries       Index binary/media filenames
 ```
 
-`--gpu` is currently a request flag with CPU fallback. The build is structured so a Zig CUDA bridge can be linked in without changing the CLI surface.
-
-## Index semantics
-
-- Text files produce one filename document plus one document per qualifying content line.
-- Binary files produce one filename-only document when `--search-binaries` is enabled.
-- Filename search text is normalized from the relative path, so `a.opus` becomes searchable via terms like `a` and `opus`.
-
-## Build
-
-Requires Zig `0.15.x`.
+Example:
 
 ```bash
-zig build --global-cache-dir .zig-global-cache
-zig build test --global-cache-dir .zig-global-cache
+./zig-out/bin/zbed index . --search-binaries
+./zig-out/bin/zbed "database connection pooling"
+./zig-out/bin/zbed status .
+./zig-out/bin/zbed bench
 ```
 
-## CI
+## Index Format
 
-The included CI workflow installs Zig, runs `./setup.sh`, builds both binaries, runs unit tests, and performs real model-backed smoke inference/search on Linux, macOS, and Windows.
+`zbed index PATH` writes `PATH/.zbed/index.bin` with:
+
+- magic/version header
+- embedding dimension and document count
+- document metadata: kind, line number, path, content, scale, norm
+- contiguous int8 embedding rows
+
+The persisted vectors are searched directly without rebuilding the embedding
+store.

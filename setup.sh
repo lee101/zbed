@@ -28,7 +28,7 @@ done
 
 # Check for zig
 if ! command -v zig &> /dev/null; then
-    echo "Warning: zig not found. You'll need Zig 0.13+ to build zbed."
+    echo "Warning: zig not found. You'll need Zig 0.15+ to build zbed."
 fi
 
 echo "Tools found."
@@ -155,8 +155,8 @@ echo "==========================================================================
 echo ""
 echo "Usage:"
 echo "  zig build                    Build zbed"
-echo "  ./zig-out/bin/bed index .    Index current directory"
-echo "  ./zig-out/bin/bed <query>    Search files and file contents"
+echo "  ./zig-out/bin/zbed index .   Index current directory"
+echo "  ./zig-out/bin/zbed <query>   Search files and file contents"
 echo "  ./zig-out/bin/zbed bench     Run performance benchmark"
 echo "  ./zig-out/bin/zbed status    Show index statistics"
 echo ""
