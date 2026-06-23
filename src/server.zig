@@ -13,6 +13,9 @@ pub const ServerState = struct {
     walk_options: index_mod.WalkOptions,
     watcher: ?watcher_mod.Watcher,
     files_changed: usize,
+    dirty: bool,
+    last_save_ns: u64,
+    save_interval_ns: u64,
 
     pub fn init(allocator: Allocator, model: *embed_mod.EmbedModel, idx: *index_mod.Index, root_path: []const u8, walk_options: index_mod.WalkOptions) ServerState {
         return .{
@@ -23,7 +26,23 @@ pub const ServerState = struct {
             .walk_options = walk_options,
             .watcher = null,
             .files_changed = 0,
+            .dirty = false,
+            .last_save_ns = 0,
+            .save_interval_ns = 30 * std.time.ns_per_s,
         };
+    }
+
+    pub fn maybeAutoSave(self: *ServerState) void {
+        if (!self.dirty or self.root_path.len == 0) return;
+        const now: u64 = @intCast(std.time.nanoTimestamp());
+        if (now - self.last_save_ns < self.save_interval_ns) return;
+        self.idx.save(self.root_path) catch |err| {
+            log("auto-save failed: {}\n", .{err});
+            return;
+        };
+        self.last_save_ns = now;
+        self.dirty = false;
+        log("auto-saved index ({d} docs)\n", .{self.idx.count()});
     }
 
     pub fn startWatching(self: *ServerState) !void {
@@ -37,14 +56,17 @@ pub const ServerState = struct {
         const n = w.poll(&events);
         if (n == 0) return 0;
 
+        // Batch deletes into a single compaction pass
+        var deletes: [64][]const u8 = undefined;
+        var n_deletes: usize = 0;
         var updated: usize = 0;
+
         for (events[0..n]) |ev| {
             switch (ev.kind) {
                 .deleted => {
-                    const removed = self.idx.removeByPath(ev.rel_path);
-                    if (removed > 0) {
-                        log("- {s} ({d} docs removed)\n", .{ ev.rel_path, removed });
-                        updated += removed;
+                    if (n_deletes < deletes.len) {
+                        deletes[n_deletes] = ev.rel_path;
+                        n_deletes += 1;
                     }
                 },
                 .created, .modified => {
@@ -60,6 +82,16 @@ pub const ServerState = struct {
                 },
             }
         }
+
+        if (n_deletes > 0) {
+            const removed = self.idx.removeByPaths(deletes[0..n_deletes]);
+            if (removed > 0) {
+                log("- {d} files ({d} docs removed)\n", .{ n_deletes, removed });
+                updated += removed;
+            }
+        }
+
+        if (updated > 0) self.dirty = true;
         self.files_changed += updated;
         return updated;
     }
@@ -96,6 +128,7 @@ pub fn run(allocator: Allocator, state: *ServerState, port: u16) !void {
     while (true) {
         // Process file watch events
         _ = state.processFileEvents();
+        state.maybeAutoSave();
 
         // Poll with 100ms timeout so we check inotify regularly
         const poll_result = std.posix.poll(&poll_fds, 100) catch 0;
@@ -188,6 +221,7 @@ fn handleIndex(allocator: Allocator, state: *ServerState, req: *std.http.Server.
         state.idx.addDocumentQuantized("api", id, text, .text, qe.data[0..state.model.embed_dim], qe.scale, qe.norm) catch continue;
         indexed += 1;
     }
+    if (indexed > 0) state.dirty = true;
 
     var buf: [256]u8 = undefined;
     const resp = std.fmt.bufPrint(&buf, "{{\"indexed\":{d},\"latency_us\":{d}}}", .{ indexed, timer.read() / 1000 }) catch "{\"indexed\":0}";
@@ -216,6 +250,11 @@ fn handleSearch(allocator: Allocator, state: *ServerState, req: *std.http.Server
         else => 10,
     } else 10;
 
+    const group: bool = if (parsed.value.object.get("group")) |gv| switch (gv) {
+        .bool => |b| b,
+        else => false,
+    } else false;
+
     if (state.idx.count() == 0) return respondJson(req, "{\"results\":[],\"latency_us\":0}");
 
     var timer = try std.time.Timer.start();
@@ -224,22 +263,47 @@ fn handleSearch(allocator: Allocator, state: *ServerState, req: *std.http.Server
 
     const search_index = state.idx.buildSearchIndex();
     var results: [100]search_mod.SearchResult = undefined;
-    const n = search_index.search(qe.data[0..state.model.embed_dim], qe.norm, @min(k, 100), 0.0, &results);
+    const raw_k = if (group) @min(k * 4, 100) else @min(k, 100);
+    const n = search_index.search(qe.data[0..state.model.embed_dim], qe.norm, raw_k, 0.0, &results);
     const elapsed_us = timer.read() / 1000;
 
     var resp: std.ArrayListUnmanaged(u8) = .{};
     defer resp.deinit(allocator);
     const w = resp.writer(allocator);
 
-    try w.print("{{\"results\":[", .{});
-    for (results[0..n], 0..) |r, i| {
-        if (i > 0) try w.writeByte(',');
-        const doc = state.idx.documents.items[r.doc_idx];
-        try w.print("{{\"id\":{d},\"text\":", .{doc.line_num});
-        try writeJsonStr(w, doc.content);
-        try w.print(",\"similarity\":{d:.6}}}", .{r.score});
+    if (group) {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const groups = try state.idx.groupResults(arena.allocator(), results[0..n], k, 3);
+
+        try w.print("{{\"groups\":[", .{});
+        for (groups, 0..) |g, gi| {
+            if (gi > 0) try w.writeByte(',');
+            try w.print("{{\"file\":", .{});
+            try writeJsonStr(w, g.file_path);
+            try w.print(",\"score\":{d:.6},\"matches\":[", .{g.best_score});
+            for (g.matches, 0..) |m, mi| {
+                if (mi > 0) try w.writeByte(',');
+                try w.print("{{\"line\":{d},\"text\":", .{m.line_num});
+                try writeJsonStr(w, m.content);
+                try w.print(",\"score\":{d:.6}}}", .{m.score});
+            }
+            try w.print("]}}", .{});
+        }
+        try w.print("],\"latency_us\":{d}}}", .{elapsed_us});
+    } else {
+        try w.print("{{\"results\":[", .{});
+        for (results[0..n], 0..) |r, i| {
+            if (i > 0) try w.writeByte(',');
+            const doc = state.idx.documents.items[r.doc_idx];
+            try w.print("{{\"file\":", .{});
+            try writeJsonStr(w, doc.file_path);
+            try w.print(",\"line\":{d},\"text\":", .{doc.line_num});
+            try writeJsonStr(w, doc.content);
+            try w.print(",\"similarity\":{d:.6}}}", .{r.score});
+        }
+        try w.print("],\"latency_us\":{d}}}", .{elapsed_us});
     }
-    try w.print("],\"latency_us\":{d}}}", .{elapsed_us});
     try respondJson(req, resp.items);
 }
 
@@ -276,6 +340,9 @@ fn handleRebuild(allocator: Allocator, state: *ServerState, req: *std.http.Serve
     var timer = try std.time.Timer.start();
     state.idx.reset();
     try index_mod.walkAndIndex(allocator, state.root_path, state.model, state.idx, state.walk_options, null);
+    state.idx.save(state.root_path) catch {};
+    state.last_save_ns = @intCast(std.time.nanoTimestamp());
+    state.dirty = false;
     const elapsed_ms = @as(f64, @floatFromInt(timer.read())) / 1_000_000.0;
     state.files_changed = 0;
 

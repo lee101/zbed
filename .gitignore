@@ -5,3 +5,7 @@ zig-out/
 *.a
 *.so
 *.dylib
+root
+zbed
+.zig-global-cache/
+.codex

@@ -17,6 +17,8 @@ const ParsedOptions = struct {
     model_dir: ?[]const u8 = null,
     search_binaries: bool = false,
     use_gpu: bool = false,
+    full_rebuild: bool = false,
+    no_group: bool = false,
 };
 
 pub fn runCli(program_name: []const u8) !void {
@@ -78,6 +80,8 @@ fn printUsage(program_name: []const u8) void {
         \\  -m, --model-dir DIR      Path to model directory
         \\      --search-binaries    Index binary/media files by filename only
         \\      --gpu                Request GPU backend when available
+        \\      --full               (index) Force full rebuild instead of incremental
+        \\      --no-group           (search) Show flat results, not grouped by file
         \\
         \\Server endpoints:
         \\  POST /search             {{"query":"text","k":10}}
@@ -110,6 +114,10 @@ fn parseCommonOptions(args: []const []const u8, start_idx: usize) ParsedOptions 
             opts.search_binaries = true;
         } else if (std.mem.eql(u8, arg, "--gpu")) {
             opts.use_gpu = true;
+        } else if (std.mem.eql(u8, arg, "--full")) {
+            opts.full_rebuild = true;
+        } else if (std.mem.eql(u8, arg, "--no-group")) {
+            opts.no_group = true;
         }
     }
     return opts;
@@ -261,11 +269,13 @@ fn cmdSearch(allocator: std.mem.Allocator, program_name: []const u8, args: []con
     var maybe_gpu_search = if (opts.use_gpu) initGpuSearchIndex(allocator, &idx) else null;
     defer if (maybe_gpu_search) |*gpu_search| gpu_search.deinit();
     var results: [MAX_RESULTS]SearchResult = undefined;
+    // Request more raw results when grouping so we can fill multiple lines per file
+    const raw_k = if (opts.no_group) @min(opts.limit, MAX_RESULTS) else @min(opts.limit * 4, MAX_RESULTS);
     const n_results = if (maybe_gpu_search) |*gpu_search|
-        gpu_search.search(&query_embedding, @min(opts.limit, MAX_RESULTS), opts.threshold, &results) catch search_index.search(
+        gpu_search.search(&query_embedding, raw_k, opts.threshold, &results) catch search_index.search(
             query_embedding.data[0..model.embed_dim],
             query_embedding.norm,
-            @min(opts.limit, MAX_RESULTS),
+            raw_k,
             opts.threshold,
             &results,
         )
@@ -273,7 +283,7 @@ fn cmdSearch(allocator: std.mem.Allocator, program_name: []const u8, args: []con
         search_index.search(
             query_embedding.data[0..model.embed_dim],
             query_embedding.norm,
-            @min(opts.limit, MAX_RESULTS),
+            raw_k,
             opts.threshold,
             &results,
         );
@@ -283,14 +293,34 @@ fn cmdSearch(allocator: std.mem.Allocator, program_name: []const u8, args: []con
         return;
     }
 
-    try stdout().print("{d} result(s) for \"{s}\":\n\n", .{ n_results, query });
-    for (results[0..n_results], 0..) |result, idx_pos| {
-        const doc = idx.documents.items[result.doc_idx];
-        switch (doc.kind) {
-            .path => try stdout().print("  {d}. [{d:.4}] {s}\n     filename: {s}\n\n", .{ idx_pos + 1, result.score, doc.file_path, doc.content }),
-            .binary => try stdout().print("  {d}. [{d:.4}] {s}\n     binary filename: {s}\n\n", .{ idx_pos + 1, result.score, doc.file_path, doc.content }),
-            .text => try stdout().print("  {d}. [{d:.4}] {s}:{d}\n     {s}\n\n", .{ idx_pos + 1, result.score, doc.file_path, doc.line_num, doc.content }),
+    if (opts.no_group) {
+        try stdout().print("{d} result(s) for \"{s}\":\n\n", .{ n_results, query });
+        for (results[0..n_results], 0..) |result, idx_pos| {
+            const doc = idx.documents.items[result.doc_idx];
+            switch (doc.kind) {
+                .path => try stdout().print("  {d}. [{d:.4}] {s}\n     filename: {s}\n\n", .{ idx_pos + 1, result.score, doc.file_path, doc.content }),
+                .binary => try stdout().print("  {d}. [{d:.4}] {s}\n     binary filename: {s}\n\n", .{ idx_pos + 1, result.score, doc.file_path, doc.content }),
+                .text => try stdout().print("  {d}. [{d:.4}] {s}:{d}\n     {s}\n\n", .{ idx_pos + 1, result.score, doc.file_path, doc.line_num, doc.content }),
+            }
         }
+        return;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const groups = try idx.groupResults(arena.allocator(), results[0..n_results], opts.limit, 3);
+
+    try stdout().print("{d} file(s) for \"{s}\":\n\n", .{ groups.len, query });
+    for (groups, 0..) |g, gi| {
+        try stdout().print("  {d}. [{d:.4}] {s}\n", .{ gi + 1, g.best_score, g.file_path });
+        for (g.matches) |m| {
+            switch (m.kind) {
+                .path => try stdout().print("       (path match)\n", .{}),
+                .binary => try stdout().print("       (binary)\n", .{}),
+                .text => try stdout().print("       :{d}  {s}\n", .{ m.line_num, m.content }),
+            }
+        }
+        try stdout().print("\n", .{});
     }
 }
 
@@ -304,7 +334,6 @@ fn cmdIndex(allocator: std.mem.Allocator, program_name: []const u8, args: []cons
     var model = try loadModel(allocator, opts);
     defer model.deinit();
 
-    try stderr().print("Indexing {s}...\n", .{opts.target_path});
     var timer = try std.time.Timer.start();
 
     var idx = Index.init(allocator, model.embed_dim);
@@ -325,15 +354,31 @@ fn cmdIndex(allocator: std.mem.Allocator, program_name: []const u8, args: []cons
         }
     }.callback;
 
-    try zbed.index.walkAndIndex(allocator, opts.target_path, &model, &idx, walk_opts, &progress);
-    try idx.save(opts.target_path);
-
-    const elapsed_ms = @as(f64, @floatFromInt(timer.read())) / 1_000_000.0;
-    try stderr().print("\r", .{});
-    const summary = try idx.summarize(allocator);
-    try stdout().print("Indexed {d} docs from {d} files in {d:.1} ms\n", .{ idx.count(), summary.files, elapsed_ms });
-    try stdout().print("  path docs: {d}, content lines: {d}, binary filename docs: {d}\n", .{ summary.path_docs, summary.text_docs, summary.binary_docs });
-    try stdout().print("  saved: {s}/.zbed/index.bin\n", .{opts.target_path});
+    const incremental = !opts.full_rebuild and Index.exists(opts.target_path);
+    if (incremental) {
+        try stderr().print("Incremental index for {s}...\n", .{opts.target_path});
+        idx.load(opts.target_path) catch {
+            try stderr().print("(load failed, falling back to full rebuild)\n", .{});
+            idx.reset();
+        };
+        const stats = try zbed.index.walkAndIndexIncremental(allocator, opts.target_path, &model, &idx, walk_opts, &progress);
+        const changed = stats.added + stats.updated + stats.removed > 0;
+        if (changed) try idx.save(opts.target_path);
+        const elapsed_ms = @as(f64, @floatFromInt(timer.read())) / 1_000_000.0;
+        try stderr().print("\r", .{});
+        try stdout().print("Incremental: +{d} new, ~{d} changed, -{d} removed, {d} unchanged ({d:.1} ms)\n", .{ stats.added, stats.updated, stats.removed, stats.unchanged, elapsed_ms });
+        try stdout().print("  total docs: {d}{s}\n", .{ idx.count(), if (changed) ", saved" else ", no changes" });
+    } else {
+        try stderr().print("Indexing {s}...\n", .{opts.target_path});
+        try zbed.index.walkAndIndex(allocator, opts.target_path, &model, &idx, walk_opts, &progress);
+        try idx.save(opts.target_path);
+        const elapsed_ms = @as(f64, @floatFromInt(timer.read())) / 1_000_000.0;
+        try stderr().print("\r", .{});
+        const summary = try idx.summarize(allocator);
+        try stdout().print("Indexed {d} docs from {d} files in {d:.1} ms\n", .{ idx.count(), summary.files, elapsed_ms });
+        try stdout().print("  path docs: {d}, content lines: {d}, binary filename docs: {d}\n", .{ summary.path_docs, summary.text_docs, summary.binary_docs });
+        try stdout().print("  saved: {s}/.zbed/index.bin\n", .{opts.target_path});
+    }
 }
 
 fn cmdStatus(allocator: std.mem.Allocator, args: []const []const u8) !void {

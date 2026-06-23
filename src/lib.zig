@@ -23,6 +23,9 @@ pub const Index = index.Index;
 pub const Document = index.Document;
 pub const DocumentKind = index.DocumentKind;
 pub const WalkOptions = index.WalkOptions;
+pub const IncrementalStats = index.IncrementalStats;
+pub const GroupedResult = index.GroupedResult;
+pub const MatchLine = index.MatchLine;
 pub const ServerState = server.ServerState;
 pub const Watcher = watcher.Watcher;
 
