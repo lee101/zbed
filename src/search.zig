@@ -49,13 +49,26 @@ pub fn cosineSimilarity(a: []const f32, b: []const f32) f32 {
 pub fn quantizedNorm(vec: []const i8) f32 {
     if (vec.len == 0) return 0;
 
-    var acc: VecI32x16 = @splat(0);
+    var acc0: VecI32x16 = @splat(0);
+    var acc1: VecI32x16 = @splat(0);
+    var acc2: VecI32x16 = @splat(0);
+    var acc3: VecI32x16 = @splat(0);
     var i: usize = 0;
+    while (i + 64 <= vec.len) : (i += 64) {
+        const v0: VecI16x16 = @as(VecI8x16, vec[i..][0..SIMD_I8_WIDTH].*);
+        const v1: VecI16x16 = @as(VecI8x16, vec[i + 16 ..][0..SIMD_I8_WIDTH].*);
+        const v2: VecI16x16 = @as(VecI8x16, vec[i + 32 ..][0..SIMD_I8_WIDTH].*);
+        const v3: VecI16x16 = @as(VecI8x16, vec[i + 48 ..][0..SIMD_I8_WIDTH].*);
+        acc0 += @as(VecI32x16, v0 * v0);
+        acc1 += @as(VecI32x16, v1 * v1);
+        acc2 += @as(VecI32x16, v2 * v2);
+        acc3 += @as(VecI32x16, v3 * v3);
+    }
     while (i + SIMD_I8_WIDTH <= vec.len) : (i += SIMD_I8_WIDTH) {
         const v: VecI16x16 = @as(VecI8x16, vec[i..][0..SIMD_I8_WIDTH].*);
-        acc += @as(VecI32x16, v * v);
+        acc0 += @as(VecI32x16, v * v);
     }
-    var sum: i32 = @reduce(.Add, acc);
+    var sum: i32 = @reduce(.Add, acc0 + acc1 + acc2 + acc3);
     while (i < vec.len) : (i += 1) {
         const v: i32 = vec[i];
         sum += v * v;
@@ -74,20 +87,28 @@ pub fn dotInt8(a: []const i8, b: []const i8) i32 {
 
     var acc0: VecI32x16 = @splat(0);
     var acc1: VecI32x16 = @splat(0);
-    while (i + 32 <= dim) : (i += 32) {
+    var acc2: VecI32x16 = @splat(0);
+    var acc3: VecI32x16 = @splat(0);
+    while (i + 64 <= dim) : (i += 64) {
         const a0: VecI16x16 = @as(VecI8x16, a[i..][0..SIMD_I8_WIDTH].*);
         const b0: VecI16x16 = @as(VecI8x16, b[i..][0..SIMD_I8_WIDTH].*);
-        const a1: VecI16x16 = @as(VecI8x16, a[i + SIMD_I8_WIDTH ..][0..SIMD_I8_WIDTH].*);
-        const b1: VecI16x16 = @as(VecI8x16, b[i + SIMD_I8_WIDTH ..][0..SIMD_I8_WIDTH].*);
+        const a1: VecI16x16 = @as(VecI8x16, a[i + 16 ..][0..SIMD_I8_WIDTH].*);
+        const b1: VecI16x16 = @as(VecI8x16, b[i + 16 ..][0..SIMD_I8_WIDTH].*);
+        const a2: VecI16x16 = @as(VecI8x16, a[i + 32 ..][0..SIMD_I8_WIDTH].*);
+        const b2: VecI16x16 = @as(VecI8x16, b[i + 32 ..][0..SIMD_I8_WIDTH].*);
+        const a3: VecI16x16 = @as(VecI8x16, a[i + 48 ..][0..SIMD_I8_WIDTH].*);
+        const b3: VecI16x16 = @as(VecI8x16, b[i + 48 ..][0..SIMD_I8_WIDTH].*);
         acc0 += @as(VecI32x16, a0 * b0);
         acc1 += @as(VecI32x16, a1 * b1);
+        acc2 += @as(VecI32x16, a2 * b2);
+        acc3 += @as(VecI32x16, a3 * b3);
     }
     while (i + SIMD_I8_WIDTH <= dim) : (i += SIMD_I8_WIDTH) {
         const va: VecI16x16 = @as(VecI8x16, a[i..][0..SIMD_I8_WIDTH].*);
         const vb: VecI16x16 = @as(VecI8x16, b[i..][0..SIMD_I8_WIDTH].*);
         acc0 += @as(VecI32x16, va * vb);
     }
-    var sum: i32 = @reduce(.Add, acc0) + @reduce(.Add, acc1);
+    var sum: i32 = @reduce(.Add, acc0 + acc1 + acc2 + acc3);
     while (i < dim) : (i += 1) {
         sum += @as(i32, a[i]) * @as(i32, b[i]);
     }
@@ -196,14 +217,16 @@ pub const FlatIndex = struct {
 pub const QuantizedFlatIndex = struct {
     embeddings: []const i8,
     norms: []const f32,
+    inv_norms: []const f32,
     n_docs: usize,
     dim: usize,
 
-    pub fn init(embeddings: []const i8, norms: []const f32, dim: usize) QuantizedFlatIndex {
+    pub fn init(embeddings: []const i8, norms: []const f32, inv_norms: []const f32, dim: usize) QuantizedFlatIndex {
         return .{
             .embeddings = embeddings,
             .norms = norms,
-            .n_docs = if (dim == 0) 0 else norms.len,
+            .inv_norms = inv_norms,
+            .n_docs = if (dim == 0) 0 else @min(norms.len, inv_norms.len),
             .dim = dim,
         };
     }
@@ -214,13 +237,15 @@ pub const QuantizedFlatIndex = struct {
         const k = @min(top_k, results_buf.len);
         if (k == 0) return 0;
         var heap_size: usize = 0;
+        const query_inv_norm = 1.0 / query_norm;
+        const q = query[0..self.dim];
 
         for (0..self.n_docs) |doc_idx| {
-            const doc_norm = self.norms[doc_idx];
-            if (doc_norm == 0) continue;
+            const doc_inv_norm = self.inv_norms[doc_idx];
+            if (doc_inv_norm == 0) continue;
 
             const row = self.embeddings[doc_idx * self.dim .. (doc_idx + 1) * self.dim];
-            const score = quantizedCosineSimilarity(query[0..self.dim], query_norm, row, doc_norm);
+            const score = @as(f32, @floatFromInt(dotInt8(q, row))) * query_inv_norm * doc_inv_norm;
             if (score < threshold) continue;
             heapPush(results_buf[0..k], &heap_size, .{ .doc_idx = doc_idx, .score = score });
         }
@@ -304,7 +329,12 @@ test "quantized flat index search" {
         quantizedNorm(embeddings[8..12]),
     };
     const query = [_]i8{ 10, 0, 0, 0 };
-    const view = QuantizedFlatIndex.init(&embeddings, &norms, dim);
+    const inv_norms = [_]f32{
+        1.0 / norms[0],
+        1.0 / norms[1],
+        1.0 / norms[2],
+    };
+    const view = QuantizedFlatIndex.init(&embeddings, &norms, &inv_norms, dim);
 
     var results: [3]SearchResult = undefined;
     const n = view.search(&query, quantizedNorm(&query), 3, 0.0, &results);

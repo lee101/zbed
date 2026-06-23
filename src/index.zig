@@ -62,6 +62,7 @@ pub const Index = struct {
     embeddings: std.ArrayListUnmanaged(i8),
     scales: std.ArrayListUnmanaged(f32),
     norms: std.ArrayListUnmanaged(f32),
+    inv_norms: std.ArrayListUnmanaged(f32),
     file_mtimes: std.StringHashMapUnmanaged(i128),
     dim: usize,
     string_arena: std.heap.ArenaAllocator,
@@ -73,6 +74,7 @@ pub const Index = struct {
             .embeddings = .{},
             .scales = .{},
             .norms = .{},
+            .inv_norms = .{},
             .file_mtimes = .{},
             .dim = dim,
             .string_arena = std.heap.ArenaAllocator.init(allocator),
@@ -85,6 +87,7 @@ pub const Index = struct {
         self.embeddings.deinit(self.allocator);
         self.scales.deinit(self.allocator);
         self.norms.deinit(self.allocator);
+        self.inv_norms.deinit(self.allocator);
         self.file_mtimes.deinit(self.allocator);
         self.string_arena.deinit();
     }
@@ -94,11 +97,13 @@ pub const Index = struct {
         self.embeddings.deinit(self.allocator);
         self.scales.deinit(self.allocator);
         self.norms.deinit(self.allocator);
+        self.inv_norms.deinit(self.allocator);
         self.file_mtimes.deinit(self.allocator);
         self.documents = .{};
         self.embeddings = .{};
         self.scales = .{};
         self.norms = .{};
+        self.inv_norms = .{};
         self.file_mtimes = .{};
         self.string_arena.deinit();
         self.string_arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -126,6 +131,7 @@ pub const Index = struct {
         try self.embeddings.appendSlice(self.allocator, embedding[0..self.dim]);
         try self.scales.append(self.allocator, scale);
         try self.norms.append(self.allocator, norm);
+        try self.inv_norms.append(self.allocator, if (norm == 0) 0 else 1.0 / norm);
     }
 
     pub fn count(self: *const Index) usize {
@@ -154,6 +160,7 @@ pub const Index = struct {
                 self.documents.items[write] = self.documents.items[read];
                 self.scales.items[write] = self.scales.items[read];
                 self.norms.items[write] = self.norms.items[read];
+                self.inv_norms.items[write] = self.inv_norms.items[read];
                 @memcpy(
                     self.embeddings.items[write * self.dim ..][0..self.dim],
                     self.embeddings.items[read * self.dim ..][0..self.dim],
@@ -165,6 +172,7 @@ pub const Index = struct {
         self.documents.items.len = write;
         self.scales.items.len = write;
         self.norms.items.len = write;
+        self.inv_norms.items.len = write;
         self.embeddings.items.len = write * self.dim;
 
         for (paths) |p| _ = self.file_mtimes.remove(p);
@@ -195,7 +203,7 @@ pub const Index = struct {
     }
 
     pub fn buildSearchIndex(self: *const Index) search_mod.QuantizedFlatIndex {
-        return search_mod.QuantizedFlatIndex.init(self.embeddings.items, self.norms.items, self.dim);
+        return search_mod.QuantizedFlatIndex.init(self.embeddings.items, self.norms.items, self.inv_norms.items, self.dim);
     }
 
     /// Group raw search results by file path. Returned slice is owned by `arena`.
@@ -311,6 +319,7 @@ pub const Index = struct {
         try self.documents.ensureTotalCapacity(self.allocator, n_docs);
         try self.scales.ensureTotalCapacity(self.allocator, n_docs);
         try self.norms.ensureTotalCapacity(self.allocator, n_docs);
+        try self.inv_norms.ensureTotalCapacity(self.allocator, n_docs);
 
         for (0..n_docs) |_| {
             var kind_buf: [1]u8 = undefined;
@@ -331,6 +340,7 @@ pub const Index = struct {
             });
             try self.scales.append(self.allocator, scale);
             try self.norms.append(self.allocator, norm);
+            try self.inv_norms.append(self.allocator, if (norm == 0) 0 else 1.0 / norm);
         }
 
         const emb_count = @as(usize, n_docs) * self.dim;
@@ -578,14 +588,27 @@ fn embedTasksParallel(
     try index.documents.ensureTotalCapacity(index.allocator, index.documents.items.len + total);
     try index.scales.ensureTotalCapacity(index.allocator, index.scales.items.len + total);
     try index.norms.ensureTotalCapacity(index.allocator, index.norms.items.len + total);
+    try index.inv_norms.ensureTotalCapacity(index.allocator, index.inv_norms.items.len + total);
     try index.embeddings.ensureTotalCapacity(index.allocator, index.embeddings.items.len + total * index.dim);
     try index.file_mtimes.ensureTotalCapacity(index.allocator, @intCast(index.file_mtimes.count() + tasks.len));
 
+    const arena = index.string_arena.allocator();
     for (indices) |*per_thread_idx| {
-        for (per_thread_idx.documents.items, 0..) |doc, i| {
-            const emb = per_thread_idx.embeddings.items[i * index.dim .. (i + 1) * index.dim];
-            try index.addDocumentQuantized(doc.file_path, doc.line_num, doc.content, doc.kind, emb, per_thread_idx.scales.items[i], per_thread_idx.norms.items[i]);
+        const doc_count = per_thread_idx.documents.items.len;
+        if (doc_count == 0) continue;
+
+        for (per_thread_idx.documents.items) |doc| {
+            try index.documents.append(index.allocator, .{
+                .file_path = try arena.dupe(u8, doc.file_path),
+                .line_num = doc.line_num,
+                .content = try arena.dupe(u8, doc.content),
+                .kind = doc.kind,
+            });
         }
+        try index.embeddings.appendSlice(index.allocator, per_thread_idx.embeddings.items);
+        try index.scales.appendSlice(index.allocator, per_thread_idx.scales.items);
+        try index.norms.appendSlice(index.allocator, per_thread_idx.norms.items);
+        try index.inv_norms.appendSlice(index.allocator, per_thread_idx.inv_norms.items);
     }
 
     for (tasks) |task| try index.setFileMtime(task.rel_path, task.mtime);
